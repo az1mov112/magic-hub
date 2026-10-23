@@ -50,6 +50,10 @@ final class AwakeController: ObservableObject {
     private var started = false
     private let pmsetQueue = DispatchQueue(label: "app.magichub.pmset")
     private let disableSleepFlag = "awake.disableSleepSetByUs"
+    /// Режим «с закрытой крышкой»: следим за крышкой, чтобы гасить экран, не усыпляя Mac.
+    private var lidTimer: Timer?
+    private(set) var lidClosed = false
+    private var lastDisplaySleep = Date.distantPast
 
     private init() {}
 
@@ -98,6 +102,7 @@ final class AwakeController: ObservableObject {
     /// При выходе из приложения — вернуть Mac обычный сон.
     func shutdown() {
         timer?.invalidate()
+        lidTimer?.invalidate()
         releaseAssertions()
         if UserDefaults.standard.bool(forKey: disableSleepFlag) {
             PrivilegedHelper.pmsetDisableSleep(false)
@@ -271,7 +276,8 @@ final class AwakeController: ObservableObject {
     }
 
     private func jiggleIfNeeded() {
-        guard isActive, Prefs.shared.jiggleMouse, Date().timeIntervalSince(lastJiggle) >= 60 else { return }
+        // При закрытой крышке «активность пользователя» разбудила бы экран под крышкой.
+        guard isActive, !lidClosed, Prefs.shared.jiggleMouse, Date().timeIntervalSince(lastJiggle) >= 60 else { return }
         lastJiggle = Date()
         var activity: IOPMAssertionID = 0
         _ = IOPMAssertionDeclareUserActivity("Magic Hub" as CFString, kIOPMUserActiveLocal, &activity)
@@ -289,6 +295,7 @@ final class AwakeController: ObservableObject {
         if hold { acquireAssertions() } else { releaseAssertions() }
         if isActive != hold { isActive = hold }
         applyClamshell(hold && Prefs.shared.clamshell)
+        watchLid(hold && Prefs.shared.clamshell)
     }
 
     private func acquireAssertions() {
@@ -298,7 +305,8 @@ final class AwakeController: ObservableObject {
                                             "Magic Hub: не давать Mac уснуть" as CFString,
                                             &sysAssertion)
         }
-        let wantDisplay = !Prefs.shared.allowDisplaySleep
+        // С закрытой крышкой экран держать незачем — пусть гаснет.
+        let wantDisplay = !Prefs.shared.allowDisplaySleep && !lidClosed
         if wantDisplay && dispAssertion == 0 {
             _ = IOPMAssertionCreateWithName("PreventUserIdleDisplaySleep" as CFString,
                                             IOPMAssertionLevel(255),
@@ -351,6 +359,52 @@ final class AwakeController: ObservableObject {
         }
     }
 
+    // MARK: Крышка закрыта — экран гаснет, Mac работает
+
+    /// С `disablesleep` Mac не засыпает при закрытой крышке, но встроенный экран под ней остаётся
+    /// включённым: греется и садит батарею. Поэтому, пока режим активен, раз в секунду смотрим на
+    /// крышку и при закрытой гасим экран (`pmset displaysleepnow`) — система при этом не спит.
+    private func watchLid(_ on: Bool) {
+        if on {
+            guard lidTimer == nil else { return }
+            let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.checkLid() }
+            t.tolerance = 0.3
+            RunLoop.main.add(t, forMode: .common)
+            lidTimer = t
+            checkLid()
+        } else {
+            lidTimer?.invalidate()
+            lidTimer = nil
+            lidClosed = false
+        }
+    }
+
+    private func checkLid() {
+        guard let closed = Self.isLidClosed() else { return }
+        if closed != lidClosed {
+            lidClosed = closed
+            lastDisplaySleep = .distantPast
+            if isActive { acquireAssertions() }   // держать экран — только с открытой крышкой
+        }
+        // С внешним монитором крышку закрывают, чтобы работать на нём, — его не трогаем.
+        guard closed, !Self.hasExternalDisplay() else { return }
+        let builtinAwake = CGDisplayIsAsleep(CGMainDisplayID()) == 0
+        let interval: TimeInterval = builtinAwake ? 5 : 60
+        guard Date().timeIntervalSince(lastDisplaySleep) >= interval else { return }
+        lastDisplaySleep = Date()
+        pmsetQueue.async { Shell.run("/usr/bin/pmset", ["displaysleepnow"]) }
+    }
+
+    /// Закрыта ли крышка (AppleClamshellState у IOPMrootDomain). nil — у Mac нет крышки.
+    static func isLidClosed() -> Bool? {
+        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard root != 0 else { return nil }
+        defer { IOObjectRelease(root) }
+        let value = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?
+            .takeRetainedValue()
+        return (value as? NSNumber)?.boolValue
+    }
+
     /// После установки помощника — применить текущее состояние.
     func helperChanged() { applyState() }
 
@@ -364,7 +418,9 @@ final class AwakeController: ObservableObject {
 
     private func screenLocked() {
         DispatchQueue.main.async {
-            guard Prefs.shared.pauseWhenLocked, self.isEnabled, self.pause == nil else { return }
+            // Закрытая крышка в режиме «с закрытой крышкой» блокирует экран — это не повод засыпать.
+            guard Prefs.shared.pauseWhenLocked, self.isEnabled, self.pause == nil,
+                  !(Prefs.shared.clamshell && self.lidClosed) else { return }
             if let end = self.endDate { self.remainingWhenPaused = end.timeIntervalSinceNow }
             self.pause = .locked
             self.applyState()

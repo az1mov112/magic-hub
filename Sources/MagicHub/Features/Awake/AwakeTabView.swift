@@ -100,7 +100,7 @@ struct AwakeTabView: View {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Работать с закрытой крышкой").font(.system(size: 13))
-                    Text("Сон полностью отключён. Следите за питанием")
+                    Text("Mac не спит, а экран под крышкой гаснет. Следите за питанием")
                         .font(.system(size: 11)).foregroundStyle(MH.t3)
                 }
                 Spacer(minLength: 4)
