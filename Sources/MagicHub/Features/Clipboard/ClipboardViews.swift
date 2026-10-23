@@ -225,6 +225,14 @@ enum ShelfActions {
         service.perform(withItems: urls)
     }
 
+    /// Файлы в буфер обмена — вставляются в Finder, Telegram, письмо.
+    static func copy(_ urls: [URL]) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.writeObjects(urls as [NSURL])
+        Clipboard.ownChangeCount = pb.changeCount
+    }
+
     /// Быстрый просмотр (как пробел в Finder).
     static func quickLook(_ urls: [URL]) {
         guard !urls.isEmpty else { return }

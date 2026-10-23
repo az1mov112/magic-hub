@@ -438,7 +438,7 @@ struct LayoutStripView: View {
                         .frame(width: NotchGeometry.layoutTile.width, height: NotchGeometry.layoutTile.height)
                 }
             }
-            Text(model.layoutHover?.title ?? "Отпустите окно на шаблоне")
+            Text(model.layoutHover?.title ?? "Раскладка окна — отпустите на шаблоне")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(model.layoutHover == nil ? MH.t3 : MH.t1)
                 .frame(height: 14)
@@ -456,18 +456,21 @@ private struct LayoutTile: View {
     var body: some View {
         GeometryReader { geo in
             let u = layout.unit
-            let inset: CGFloat = 3
+            let inset: CGFloat = 3.5
             let w = geo.size.width - inset * 2, h = geo.size.height - inset * 2
             ZStack(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(active ? 0.16 : 0.07))
-                RoundedRectangle(cornerRadius: 2.5)
-                    .fill(active ? MH.accent : Color.white.opacity(0.55))
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(active ? 0.22 : 0))
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(Color.white.opacity(active ? 1 : 0.55), lineWidth: 1.5)
+                RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                    .fill(Color.white.opacity(active ? 1 : 0.7))
                     .frame(width: max(2, u.width * w - 1.5), height: max(2, u.height * h - 1.5))
                     .offset(x: inset + u.minX * w + 0.75, y: inset + u.minY * h + 0.75)
             }
         }
-        .overlay(RoundedRectangle(cornerRadius: 5).stroke(active ? MH.accent : Color.clear, lineWidth: 1.5))
-        .scaleEffect(active ? 1.08 : 1)
+        .scaleEffect(active ? 1.12 : 1)
+        .shadow(color: .white.opacity(active ? 0.25 : 0), radius: 6)
     }
 }
 

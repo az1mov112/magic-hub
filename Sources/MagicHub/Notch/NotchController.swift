@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import Combine
 
-enum NotchMode: Equatable { case idle, live, hud, notif, open, layout }
+enum NotchMode: Equatable { case idle, live, hud, notif, open, layout, drop }
 
 /// Размеры чёлки для конкретного экрана.
 /// wide — своя чёлка на Mac без выреза (как в Cyclop), cutout — под настоящий вырез.
@@ -61,14 +61,25 @@ struct NotchGeometry: Equatable {
 
     // Полоса шаблонов раскладки окон: плитки фиксированного размера, чтобы попадание курсора
     // считалось по тем же числам, по которым они нарисованы.
-    static let layoutTile = CGSize(width: 46, height: 30)
-    static let layoutGap: CGFloat = 8
-    static let layoutPadding: CGFloat = 16
+    static let layoutTile = CGSize(width: 50, height: 32)
+    static let layoutGap: CGFloat = 16
+    static let layoutPadding: CGFloat = 22
     var layoutTopInset: CGFloat { (isCutout ? notchSize.height : max(menuBarHeight, 24)) + 8 }
     var layoutSize: CGSize {
         let n = CGFloat(WindowLayout.strip.count)
         let w = Self.layoutPadding * 2 + n * Self.layoutTile.width + (n - 1) * Self.layoutGap
         return CGSize(width: w, height: layoutTopInset + Self.layoutTile.height + 6 + 14 + 12)
+    }
+
+    // Полоса действий для файла, который тащат к чёлке.
+    static let dropCard = CGSize(width: 96, height: 132)
+    static let dropGap: CGFloat = 10
+    static let dropPadding: CGFloat = 16
+    var dropTopInset: CGFloat { (isCutout ? notchSize.height : max(menuBarHeight, 24)) + 8 }
+    var dropSize: CGSize {
+        let n = CGFloat(DropAction.allCases.count)
+        return CGSize(width: Self.dropPadding * 2 + n * Self.dropCard.width + (n - 1) * Self.dropGap,
+                      height: dropTopInset + 14 + 8 + Self.dropCard.height + 16)
     }
 
     /// Номер шаблона под курсором (координаты экрана) — по горизонтали, с допуском по высоте.
@@ -94,6 +105,7 @@ struct NotchGeometry: Equatable {
         case .notif: return notifSize
         case .open: return openSize
         case .layout: return layoutSize
+        case .drop: return dropSize
         }
     }
 
@@ -101,6 +113,7 @@ struct NotchGeometry: Equatable {
         switch mode {
         case .open: return 26
         case .layout: return 22
+        case .drop: return 26
         case .notif: return 24
         case .live: return isCutout ? 12 : 14
         case .hud: return isCutout ? 14 : 18
@@ -121,12 +134,15 @@ final class NotchModel: ObservableObject {
     /// Тащат окно к чёлке — показать шаблоны раскладки.
     @Published var layoutActive = false
     @Published var layoutHover: WindowLayout?
+    /// Тащат файл к чёлке — показать полосу действий.
+    @Published var dropActive = false
 
     init(geometry: NotchGeometry) { self.geometry = geometry }
 
     var mode: NotchMode {
         if isOpen { return .open }
         if layoutActive { return .layout }
+        if dropActive { return .drop }
         if HUDModel.shared.current != nil { return .hud }
         if AppModel.shared.notification != nil { return .notif }
         if Prefs.shared.liveIndicators && (NowPlayingModel.shared.isPlaying || AwakeController.shared.isActive || JarvisMonitor.shared.isBusy) {
@@ -209,6 +225,17 @@ final class NotchController {
         if model.layoutActive {
             panel.ignoresMouseEvents = true
             cancelOpen()
+            return
+        }
+        if model.dropActive {
+            // Окно должно принимать перетаскивание, пока курсор над полосой действий.
+            let g = model.geometry
+            var r = g.screenRect(for: g.dropSize).insetBy(dx: -30, dy: -30)
+            r.size.height += 30
+            let inside = r.contains(p)
+            if panel.ignoresMouseEvents == inside { panel.ignoresMouseEvents = !inside }
+            cancelOpen()
+            cancelClose()
             return
         }
         let inside = activeRect.contains(p)
@@ -400,7 +427,7 @@ final class NotchManager {
         pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let self else { return }
             let p = NSEvent.mouseLocation
-            if p != self.lastPoint { self.mouseMoved() }
+            if p != self.lastPoint || (self.fileDragging && NSEvent.pressedMouseButtons & 1 == 0) { self.mouseMoved() }
         }
         pollTimer?.tolerance = interval * 0.25
     }
@@ -408,7 +435,11 @@ final class NotchManager {
     private func mouseMoved() {
         let p = NSEvent.mouseLocation
         lastPoint = p
-        if NSEvent.pressedMouseButtons & 1 != 0 { checkFileDrag(p) }
+        if NSEvent.pressedMouseButtons & 1 != 0 {
+            checkFileDrag(p)
+        } else if fileDragging {
+            endFileDrag()   // отпускание кнопки могло не дойти до наших мониторов
+        }
         controllers.forEach { $0.handleMove(p) }
     }
 
@@ -425,33 +456,45 @@ final class NotchManager {
 
     private func checkFileDrag(_ p: NSPoint) {
         let prefs = Prefs.shared
-        guard prefs.shelfDragOpen, prefs.isVisible(.shelf), !WindowLayoutManager.shared.windowDragging,
+        guard prefs.shelfDragOpen, !WindowLayoutManager.shared.windowDragging,
               let c = controllers.first(where: { $0.screen.frame.contains(p) }) else { return }
-        let f = c.screen.frame
-        // Курсор у верхнего края, рядом с чёлкой.
-        guard p.y >= f.maxY - 60, abs(p.x - f.midX) <= 280 else { return }
+        let g = c.model.geometry
+        let f = g.screenFrame
+        // Показать у верхнего края рядом с чёлкой; держать, пока курсор над полосой; увели — спрятать.
+        let near = p.y >= f.maxY - 60 && abs(p.x - f.midX) <= 280
+        let stay = c.model.dropActive && g.screenRect(for: g.dropSize).insetBy(dx: -80, dy: -80).contains(p)
+        guard near || stay else {
+            if c.model.dropActive { c.model.dropActive = false }
+            return
+        }
         if !fileDragging {
             let pb = NSPasteboard(name: .drag)
             guard pb.changeCount != dragChangeAtDown, let types = pb.types,
                   types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType")) else { return }
             fileDragging = true
+            AppModel.shared.dragURLs = (pb.readObjects(forClasses: [NSURL.self]) as? [URL]) ?? []
         }
         let app = AppModel.shared
-        if !app.fileDragActive {
-            app.fileDragActive = true
-            app.tab = .shelf
-            c.open()
+        if !app.fileDragActive { app.fileDragActive = true }
+        if !c.model.dropActive {
+            c.close()
+            c.model.dropActive = true
+            c.panel.ignoresMouseEvents = false
         }
     }
 
-    private func endFileDrag() {
+    /// Перетаскивание закончилось (отпустили кнопку или бросили файл на действие).
+    func endFileDrag() {
         guard fileDragging || AppModel.shared.fileDragActive else { return }
         fileDragging = false
-        // Дать полке принять файл, затем вернуть обычное поведение: увели курсор — панель свернётся.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             AppModel.shared.fileDragActive = false
+            AppModel.shared.dragURLs = []
             let p = NSEvent.mouseLocation
-            self?.controllers.forEach { $0.handleMove(p) }
+            self?.controllers.forEach { c in
+                c.model.dropActive = false
+                c.handleMove(p)
+            }
         }
     }
 

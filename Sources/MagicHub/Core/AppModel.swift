@@ -87,8 +87,10 @@ final class AppModel: ObservableObject {
     @Published var toast: String?
     /// Пока true, панель не сворачивается сама (например, идёт телесуфлёр).
     @Published var pinnedOpen = false
-    /// Сейчас к чёлке тащат файл — панель открыта на полке и ждёт, пока его отпустят.
+    /// Сейчас к чёлке тащат файл — из неё выехала полоса действий.
     @Published var fileDragActive = false
+    /// Какие файлы тащат (чтобы погасить неподходящие действия, например «Конвертацию» не для картинок).
+    @Published var dragURLs: [URL] = []
     /// До этого момента панель не сворачивается (например, сразу после смены размера).
     var holdOpenUntil = Date.distantPast
 

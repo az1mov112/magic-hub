@@ -23,7 +23,7 @@ struct NotchRootView: View {
             shape
                 .fill(Color.black)
                 .frame(width: size.width, height: size.height)
-                .shadow(color: .black.opacity(mode == .open ? 0.55 : (mode == .notif ? 0.35 : 0)), radius: 22, y: 10)
+                .shadow(color: .black.opacity([.open, .drop, .layout].contains(mode) ? 0.55 : (mode == .notif ? 0.35 : 0)), radius: 22, y: 10)
 
             ZStack(alignment: .top) {
                 switch mode {
@@ -43,6 +43,9 @@ struct NotchRootView: View {
                         .transition(.opacity)
                 case .layout:
                     LayoutStripView(model: model)
+                        .transition(.opacity)
+                case .drop:
+                    DropActionsView(model: model)
                         .transition(.opacity)
                 case .hud:
                     HUDContent(cutout: g.isCutout, notchWidth: g.notchSize.width)
@@ -296,28 +299,10 @@ struct PanelView: View {
         }
         .frame(width: g.openSize.width, height: g.openSize.height, alignment: .top)
         .foregroundStyle(MH.t1)
-        .overlay {
-            // Файл тащат к чёлке — подсказка, куда отпустить.
-            if app.fileDragActive {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(MH.accent, style: StrokeStyle(lineWidth: 2, dash: [7, 5]))
-                    .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(MH.accent.opacity(dropTargeted ? 0.16 : 0.08)))
-                    .overlay {
-                        VStack(spacing: 8) {
-                            Image(systemName: "tray.and.arrow.down.fill").font(.system(size: 30)).foregroundStyle(MH.accent)
-                            Text("Отпустите — файл ляжет на полку").font(.system(size: 15, weight: .semibold))
-                            Text("Сам файл останется на месте").font(.system(size: 12)).foregroundStyle(MH.t2)
-                        }
-                    }
-                    .padding(EdgeInsets(top: g.headerTop + 6, leading: 12, bottom: 12, trailing: 12))
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-            }
-        }
+        // Файл, брошенный прямо в открытую панель, ложится на полку.
         .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: $dropTargeted) { providers in
             ShelfDrop.handle(providers)
         }
-        .animation(.easeOut(duration: 0.15), value: app.fileDragActive)
         .onPreferenceChange(PanelMetaKey.self) { meta = $0 }
         .onChange(of: app.tab) { meta = "" }
         .onAppear(perform: fixHiddenTab)
