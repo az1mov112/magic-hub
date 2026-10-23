@@ -623,7 +623,7 @@ final class JarvisMonitor: ObservableObject {
     private func diagnosticsText() -> String {
         let s = collect()
         var l = ["[Джарвис]"]
-        l.append("процесс: " + (s.pid.map { "есть, работает \(Fmt.duration(s.uptime ?? 0))" } ?? "не найден"))
+        l.append("процесс: " + (s.pid.map { _ in "есть, работает \(Fmt.duration(s.uptime ?? 0))" } ?? "не найден"))
         l.append("служба launchd: " + (s.serviceLabel == nil ? "не найдена" : "есть, \(s.serviceState ?? "?")"))
         l.append("Telegram-поллеров: \(s.pollers)")
         l.append("папка бота: " + Self.mask(s.botDir ?? "—"))
