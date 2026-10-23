@@ -285,6 +285,16 @@ enum SysPower {
         return (type as String) == "AC Power"
     }
 
+    /// Только температура батареи — без чтения всего реестра AppleSmartBattery.
+    static func batteryTemperature() -> Double? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let n = IORegistryEntryCreateCFProperty(service, "Temperature" as CFString, kCFAllocatorDefault, 0)?
+                .takeRetainedValue() as? NSNumber, n.doubleValue > 0 else { return nil }
+        return n.doubleValue / 100
+    }
+
     static func smartBattery() -> [String: Any]? {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
         guard service != 0 else { return nil }

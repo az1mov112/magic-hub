@@ -406,16 +406,20 @@ final class NotionService: ObservableObject {
 
     // MARK: Статусы
 
+    /// «Готово», «Выполнено», «Done», «Отменено» — закрыта; «К выполнению», «Не выполнено», «To do» — открыта.
     static func isClosedStatus(_ s: String?) -> Bool {
         guard let s = s?.lowercased() else { return false }
-        return s.contains("готов") || s.contains("выполн") || s.contains("done") || s.contains("complete")
+        let open = ["к выполн", "не выполн", "не готов", "не заверш", "to do", "todo", "not done", "not started", "incomplete"]
+        if open.contains(where: { s.contains($0) }) { return false }
+        return s.contains("готов") || s.contains("выполнен") || s.contains("done") || s.contains("complete")
             || s.contains("отмен") || s.contains("cancel") || s.contains("заверш")
     }
 
+    /// Статус, который ставит галочка: закрытый, но не «Отменено».
     static func doneName(_ schema: NotionSchema) -> String {
         if let o = schema.statusOptions.first(where: { o in
             let n = o.name.lowercased()
-            return n.contains("готов") || n.contains("done") || n.contains("выполн") || n.contains("complete")
+            return isClosedStatus(o.name) && !n.contains("отмен") && !n.contains("cancel")
         }) { return o.name }
         return "Готово"
     }

@@ -90,11 +90,18 @@ final class SysMonitor: ObservableObject {
                 hid = h.isAvailable ? h : nil
             }
         }
-        s.cpuTemp = hid?.cpuTemperature() ?? SysSMCTemperature.cpuTemperature()
+        // Пока окошко закрыто, читаем только то, что видно в меню-баре: датчики и реестр батареи недёшевы.
+        let prefs = Prefs.shared
+        if detailed || prefs.mbCPUTemp {
+            s.cpuTemp = hid?.cpuTemperature() ?? SysSMCTemperature.cpuTemperature()
+        }
         s.memory = SysMemory.read()
         s.uptime = SysCtl.uptime()
-        s.battery = SysPower.read(includeDetails: true)
-        if FanController.shared.hasFans {
+        s.battery = SysPower.read(includeDetails: detailed)
+        if !detailed, prefs.mbBatteryTemp, s.battery != nil {
+            s.battery?.temperature = SysPower.batteryTemperature()
+        }
+        if FanController.shared.hasFans && (detailed || prefs.mbFan) {
             s.fans = FanSMC.readFans(SMCConnection.shared)
         }
 

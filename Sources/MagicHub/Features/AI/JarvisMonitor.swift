@@ -319,6 +319,15 @@ final class JarvisMonitor: ObservableObject {
                     r.lastTaskDate = date
                     replyAfterTask = nil
                 }
+            case "attachment":
+                // Сообщение, пришедшее посреди хода, Claude Code записывает вложением (queued_command).
+                if let att = obj["attachment"] as? [String: Any],
+                   let t = (att["prompt"] as? String) ?? Self.text(of: att["prompt"]) ?? Self.text(of: att["content"]),
+                   let task = Self.channelText(t) {
+                    r.lastTask = task
+                    r.lastTaskDate = date
+                    replyAfterTask = nil
+                }
             case "assistant":
                 lastActivityIndex = index
                 if let usage = message?["usage"] as? [String: Any] {
@@ -618,15 +627,15 @@ final class JarvisMonitor: ObservableObject {
             URL(fileURLWithPath: $0).appendingPathComponent("claude-\(getuid())").appendingPathComponent(dir.lastPathComponent)
                 .resolvingSymlinksInPath().path
         })
+        let fresh = Date().addingTimeInterval(-3600)
         for root in roots {
-            guard let e = fm.enumerator(at: URL(fileURLWithPath: root), includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey]) else { continue }
-            var seen = 0
-            for case let f as URL in e {
-                seen += 1
-                if seen > 3000 { break }
-                guard (try? f.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
-                      let fd = mtime(f), fd > recent else { continue }
-                found.append(("tmp/" + f.lastPathComponent, fd))
+            let sessions = (try? fm.contentsOfDirectory(at: URL(fileURLWithPath: root), includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+            for s in sessions {
+                let tasks = s.appendingPathComponent("tasks")
+                guard let d = mtime(tasks) ?? mtime(s), d > fresh else { continue }
+                for f in (try? fm.contentsOfDirectory(at: tasks, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
+                    if let fd = mtime(f), fd > recent { found.append(("tmp/" + f.lastPathComponent, fd)) }
+                }
             }
         }
         return found.sorted { $0.1 > $1.1 }
@@ -688,6 +697,8 @@ final class JarvisMonitor: ObservableObject {
             } else if let str = content as? String {
                 parts.append(str.contains("<channel") ? "сообщение из Telegram" : "текст")
             }
+            if let att = o["attachment"] as? [String: Any], let at = att["type"] as? String { parts.append(at) }
+            if type == "attachment", line.contains("<channel") { parts.append("сообщение из Telegram") }
             if (o["isSidechain"] as? Bool) == true { parts.append("sidechain") }
             if (o["isApiErrorMessage"] as? Bool) == true || o["error"] != nil { parts.append("ошибка") }
             return parts.joined(separator: " ")

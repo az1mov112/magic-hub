@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-private enum SysPopTab: Hashable { case system, power, fans, boost }
+private enum SysPopTab: String { case system, power, fans, boost }
 
 /// Окошко по клику на цифры в меню-баре.
 struct SystemPopoverView: View {
@@ -10,7 +10,8 @@ struct SystemPopoverView: View {
 
     @ObservedObject private var mon = SysMonitor.shared
     @ObservedObject private var fans = FanController.shared
-    @State private var tab: SysPopTab = .system
+    /// Окошко создаётся заново при каждом открытии — выбранная вкладка запоминается.
+    @AppStorage("sysPopover.tab") private var tab: SysPopTab = .system
 
     var body: some View {
         VStack(spacing: 12) {
@@ -30,6 +31,7 @@ struct SystemPopoverView: View {
         .background(Color(hex: "1E1E20"))
         .foregroundStyle(MH.t1)
         .environment(\.colorScheme, .dark)
+        .onAppear { if tab == .fans && !fans.hasFans { tab = .system } }
     }
 
     private var tabOptions: [(SysPopTab, String)] {

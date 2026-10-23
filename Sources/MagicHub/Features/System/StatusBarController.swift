@@ -35,6 +35,9 @@ final class StatusBarController: NSObject {
     private var anchorTop: CGFloat = 0
     private var anchorMidX: CGFloat = 0
     private var contentHeight: CGFloat = 0
+    /// Содержимое окошка создаётся при открытии и убирается при закрытии: скрытый SwiftUI-вид
+    /// иначе перерисовывал бы графики и списки процессов каждые пару секунд впустую.
+    private var makeContent: (() -> NSView)?
     private var monitors: [Any] = []
     private var cancellables = Set<AnyCancellable>()
     private var started = false
@@ -54,27 +57,29 @@ final class StatusBarController: NSObject {
             button.setAccessibilityLabel("Показатели системы Magic Hub")
         }
 
-        let content = SystemPopoverView(
-            onSettings: { [weak self] in
-                self?.closePanel()
-                AppModel.shared.open(.settings)
-            },
-            onActivityMonitor: { [weak self] in
-                self?.closePanel()
-                let url = URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app")
-                NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+        makeContent = { [weak self] in
+            let content = SystemPopoverView(
+                onSettings: { [weak self] in
+                    self?.closePanel()
+                    AppModel.shared.open(.settings)
+                },
+                onActivityMonitor: { [weak self] in
+                    self?.closePanel()
+                    let url = URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app")
+                    NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+                }
+            )
+            .fixedSize(horizontal: false, vertical: true)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.white.opacity(0.09), lineWidth: 1))
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { [weak self] size in
+                self?.contentSizeChanged(size)
             }
-        )
-        .fixedSize(horizontal: false, vertical: true)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.white.opacity(0.09), lineWidth: 1))
-        .onGeometryChange(for: CGSize.self) { $0.size } action: { [weak self] size in
-            self?.contentSizeChanged(size)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            let host = NSHostingView(rootView: content)
+            host.sizingOptions = []
+            return host
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        let host = NSHostingView(rootView: content)
-        host.sizingOptions = []
-        panel.contentView = host
 
         _ = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                    object: nil, queue: .main) { [weak self] _ in self?.closePanel() }
@@ -114,6 +119,7 @@ final class StatusBarController: NSObject {
         anchorTop = anchor.minY - 5
         anchorMidX = anchor.midX
         SysMonitor.shared.detailed = true
+        panel.contentView = makeContent?()
         place(height: contentHeight > 1 ? contentHeight : 420)
         panel.makeKeyAndOrderFront(nil)
         installMonitors()
@@ -122,6 +128,7 @@ final class StatusBarController: NSObject {
     private func closePanel() {
         guard panel.isVisible else { return }
         panel.orderOut(nil)
+        panel.contentView = nil
         monitors.forEach(NSEvent.removeMonitor)
         monitors.removeAll()
         SysMonitor.shared.detailed = false
