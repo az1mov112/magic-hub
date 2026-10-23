@@ -166,7 +166,7 @@ struct DropActionsView: View {
     var body: some View {
         let g = model.geometry
         VStack(alignment: .leading, spacing: 8) {
-            Text("БРОСЬТЕ НА ДЕЙСТВИЕ")
+            Text("БРОСЬ НА ДЕЙСТВИЕ")
                 .font(.system(size: 10, weight: .semibold))
                 .kerning(0.9)
                 .foregroundStyle(MH.t3)
@@ -189,24 +189,25 @@ private struct DropCard: View {
     @State private var targeted = false
 
     var body: some View {
-        VStack(spacing: 7) {
+        VStack(spacing: 6) {
             Image(systemName: action.icon)
-                .font(.system(size: 22, weight: .medium))
-                .foregroundStyle(action == .trash ? MH.red : MH.t1)
-                .frame(height: 28)
-            Text(action.title).font(.system(size: 12, weight: .semibold)).foregroundStyle(MH.t1)
-            Text(action.subtitle).font(.system(size: 10)).foregroundStyle(MH.t2)
+                .font(.system(size: 24, weight: .medium))
+                .foregroundStyle(enabled ? (action == .trash ? MH.red : MH.t1) : MH.t3)
+                .frame(height: 30)
+                .padding(.bottom, 2)
+            Text(action.title).font(.system(size: 12, weight: .bold)).foregroundStyle(enabled ? MH.t1 : MH.t3)
+            Text(action.subtitle).font(.system(size: 10)).foregroundStyle(enabled ? MH.t2 : MH.t3.opacity(0.7))
                 .multilineTextAlignment(.center)
                 .lineLimit(2)
         }
         .padding(.horizontal, 6)
+        .padding(.bottom, 12)   // содержимое чуть выше центра, как на карточках Notchy
         .frame(width: NotchGeometry.dropCard.width, height: NotchGeometry.dropCard.height)
         .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(Color.white.opacity(targeted ? 0.2 : 0.08)))
+            .fill(Color(white: targeted ? 0.34 : (enabled ? 0.2 : 0.11))))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .strokeBorder(Color.white.opacity(targeted ? 0.85 : 0.1), lineWidth: targeted ? 1.5 : 1))
+            .strokeBorder(Color.white.opacity(targeted ? 0.9 : 0.06), lineWidth: targeted ? 2 : 1))
         .scaleEffect(targeted ? 1.05 : 1)
-        .opacity(enabled ? 1 : 0.35)
         .animation(.spring(response: 0.2, dampingFraction: 0.8), value: targeted)
         .onDrop(of: [UTType.fileURL], isTargeted: $targeted) { providers in
             guard enabled else { return false }

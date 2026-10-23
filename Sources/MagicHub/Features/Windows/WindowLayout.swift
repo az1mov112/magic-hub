@@ -431,20 +431,27 @@ struct LayoutStripView: View {
 
     var body: some View {
         let g = model.geometry
-        VStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("РАСКЛАДКА ОКНА")
+                    .font(.system(size: 10, weight: .semibold))
+                    .kerning(0.9)
+                    .foregroundStyle(MH.t3)
+                Text(model.layoutHover?.title ?? "отпустите окно на шаблоне")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(model.layoutHover == nil ? MH.t3 : MH.t1)
+            }
+            .frame(height: 14)
             HStack(spacing: NotchGeometry.layoutGap) {
                 ForEach(Array(WindowLayout.strip.enumerated()), id: \.offset) { _, layout in
                     LayoutTile(layout: layout, active: model.layoutHover == layout)
                         .frame(width: NotchGeometry.layoutTile.width, height: NotchGeometry.layoutTile.height)
                 }
             }
-            Text(model.layoutHover?.title ?? "Раскладка окна — отпустите на шаблоне")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(model.layoutHover == nil ? MH.t3 : MH.t1)
-                .frame(height: 14)
         }
         .padding(.top, g.layoutTopInset)
-        .frame(width: g.layoutSize.width, height: g.layoutSize.height, alignment: .top)
+        .padding(.horizontal, NotchGeometry.layoutPadding)
+        .frame(width: g.layoutSize.width, height: g.layoutSize.height, alignment: .topLeading)
         .animation(.easeOut(duration: 0.12), value: model.layoutHover)
     }
 }
@@ -460,7 +467,7 @@ private struct LayoutTile: View {
             let w = geo.size.width - inset * 2, h = geo.size.height - inset * 2
             ZStack(alignment: .topLeading) {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.white.opacity(active ? 0.22 : 0))
+                    .fill(Color.white.opacity(active ? 0.45 : 0))
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .strokeBorder(Color.white.opacity(active ? 1 : 0.55), lineWidth: 1.5)
                 RoundedRectangle(cornerRadius: 2.5, style: .continuous)

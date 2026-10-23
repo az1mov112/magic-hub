@@ -68,11 +68,11 @@ struct NotchGeometry: Equatable {
     var layoutSize: CGSize {
         let n = CGFloat(WindowLayout.strip.count)
         let w = Self.layoutPadding * 2 + n * Self.layoutTile.width + (n - 1) * Self.layoutGap
-        return CGSize(width: w, height: layoutTopInset + Self.layoutTile.height + 6 + 14 + 12)
+        return CGSize(width: w, height: layoutTopInset + 14 + 10 + Self.layoutTile.height + 16)
     }
 
     // Полоса действий для файла, который тащат к чёлке.
-    static let dropCard = CGSize(width: 96, height: 132)
+    static let dropCard = CGSize(width: 100, height: 168)
     static let dropGap: CGFloat = 10
     static let dropPadding: CGFloat = 16
     var dropTopInset: CGFloat { (isCutout ? notchSize.height : max(menuBarHeight, 24)) + 8 }
