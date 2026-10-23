@@ -59,11 +59,22 @@ final class ClaudeUsageMonitor: ObservableObject {
     func start() {
         refreshUsage()
         refreshLimits()
-        usageTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: true) { [weak self] _ in self?.refreshUsage() }
+        scheduleUsage()
+        Prefs.shared.$lite.dropFirst().removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.scheduleUsage() }
+            .store(in: &cancellables)
         limitsTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in self?.refreshLimits() }
         Prefs.shared.$claudeLimits.dropFirst().receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.refreshLimits() }
             .store(in: &cancellables)
+    }
+
+    /// Подсчёт расходов читает журналы Claude Code — в экономном режиме реже.
+    private func scheduleUsage() {
+        usageTimer?.invalidate()
+        let interval: TimeInterval = Prefs.shared.lite ? 180 : 45
+        usageTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in self?.refreshUsage() }
+        usageTimer?.tolerance = interval * 0.2
     }
 
     func refreshAll() {

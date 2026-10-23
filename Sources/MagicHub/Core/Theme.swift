@@ -63,6 +63,7 @@ struct MHSegmented<T: Hashable>: View {
                     Text(opt.1)
                         .font(.system(size: 12))
                         .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
                         .foregroundStyle(selection == opt.0 ? MH.t1 : MH.t2)

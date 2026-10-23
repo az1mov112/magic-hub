@@ -70,6 +70,9 @@ final class JarvisMonitor: ObservableObject {
         Prefs.shared.$aiInterval.dropFirst().receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.schedule() }
             .store(in: &cancellables)
+        Prefs.shared.$lite.dropFirst().removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.schedule() }
+            .store(in: &cancellables)
         Prefs.shared.$jarvisEnabled.dropFirst().receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.refresh() }
             .store(in: &cancellables)
@@ -83,10 +86,21 @@ final class JarvisMonitor: ObservableObject {
     }
 
     private func schedule() {
-        timer?.invalidate()
         refresh()
-        let interval = max(5, Prefs.shared.aiInterval)
+        startTimer()
+    }
+
+    /// Бота нет на этом Mac — проверяем редко, чтобы не запускать ps и launchctl каждые несколько секунд.
+    private var idleBackoff = false
+    private var notFoundCount = 0
+
+    private func startTimer() {
+        timer?.invalidate()
+        var interval = max(5, Prefs.shared.aiInterval)
+        if Prefs.shared.lite { interval = max(20, interval) }
+        if idleBackoff { interval = max(60, interval) }
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in self?.refresh() }
+        timer?.tolerance = interval * 0.2
     }
 
     func refresh() {
@@ -263,7 +277,7 @@ final class JarvisMonitor: ObservableObject {
         }
         var r = SessionParse()
         r.lastActivity = mtime
-        let window = 3 * 1024 * 1024
+        let window = (Prefs.shared.lite ? 1 : 3) * 1024 * 1024
         guard let text = Self.tail(of: url, bytes: window) else { return r }
 
         var lines = text.split(separator: "\n", omittingEmptySubsequences: true)
@@ -359,6 +373,12 @@ final class JarvisMonitor: ObservableObject {
     private func apply(_ s: JarvisState) {
         let prev = state
         state = s
+        notFoundCount = s.found ? 0 : notFoundCount + 1
+        let backoff = notFoundCount >= 3
+        if backoff != idleBackoff {
+            idleBackoff = backoff
+            startTimer()
+        }
         if isBusy != s.busy { isBusy = s.busy }
 
         defer { initialized = true }

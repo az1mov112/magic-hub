@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Корневой вид окна чёлки: чёрная форма, которая растёт из выреза.
 struct NotchRootView: View {
@@ -96,33 +97,120 @@ private struct LiveContent: View {
     }
 }
 
+/// Пульсирующая точка «Джарвис занят». Анимацию крутит Core Animation в системном
+/// сервере отрисовки — приложение при этом не тратит процессор. В экономном режиме точка неподвижна.
 struct PulsingDot: View {
     let color: Color
-    @State private var dim = false
+    @ObservedObject private var prefs = Prefs.shared
 
     var body: some View {
-        Circle().fill(color).frame(width: 7, height: 7)
-            .opacity(dim ? 0.35 : 1)
-            .onAppear {
-                withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { dim = true }
-            }
+        LayerAnimationView(kind: .pulse(NSColor(color)), animated: !prefs.lite)
+            .frame(width: 7, height: 7)
     }
 }
 
-/// Три полоски эквалайзера, пока играет музыка.
+/// Три полоски эквалайзера, пока играет музыка (тоже на Core Animation).
 struct EqualizerBars: View {
+    @ObservedObject private var prefs = Prefs.shared
+
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.18)) { context in
-            let t = context.date.timeIntervalSinceReferenceDate
-            HStack(alignment: .bottom, spacing: 2) {
-                ForEach(0..<3, id: \.self) { i in
-                    let h = 3 + 9 * abs(sin(t * 3.1 + Double(i) * 1.3))
-                    Capsule().fill(MH.t1).frame(width: 3, height: h)
-                        .animation(.easeInOut(duration: 0.18), value: h)
+        LayerAnimationView(kind: .equalizer(NSColor(MH.t1)), animated: !prefs.lite)
+            .frame(width: 13, height: 12)
+    }
+}
+
+private struct LayerAnimationView: NSViewRepresentable {
+    enum Kind {
+        case pulse(NSColor)
+        case equalizer(NSColor)
+    }
+
+    let kind: Kind
+    let animated: Bool
+
+    func makeNSView(context: Context) -> LayerAnimationNSView { LayerAnimationNSView(kind: kind) }
+
+    func updateNSView(_ view: LayerAnimationNSView, context: Context) { view.animated = animated }
+}
+
+private final class LayerAnimationNSView: NSView {
+    private let kind: LayerAnimationView.Kind
+    private var shapes: [CALayer] = []
+
+    var animated = true {
+        didSet { if animated != oldValue { needsLayout = true } }
+    }
+
+    init(kind: LayerAnimationView.Kind) {
+        self.kind = kind
+        super.init(frame: .zero)
+        wantsLayer = true
+        let count: Int
+        let color: NSColor
+        switch kind {
+        case .pulse(let c): count = 1; color = c
+        case .equalizer(let c): count = 3; color = c
+        }
+        for _ in 0..<count {
+            let l = CALayer()
+            l.backgroundColor = color.cgColor
+            l.anchorPoint = CGPoint(x: 0.5, y: 0)
+            layer?.addSublayer(l)
+            shapes.append(l)
+        }
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        switch kind {
+        case .pulse:
+            guard let dot = shapes.first else { break }
+            dot.bounds = bounds
+            dot.position = CGPoint(x: bounds.midX, y: 0)
+            dot.cornerRadius = min(bounds.width, bounds.height) / 2
+            if animated {
+                if dot.animation(forKey: "pulse") == nil {
+                    let a = CABasicAnimation(keyPath: "opacity")
+                    a.fromValue = 1.0
+                    a.toValue = 0.35
+                    a.duration = 0.7
+                    a.autoreverses = true
+                    a.repeatCount = .infinity
+                    a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    dot.add(a, forKey: "pulse")
+                }
+            } else {
+                dot.removeAllAnimations()
+            }
+        case .equalizer:
+            for (i, bar) in shapes.enumerated() {
+                bar.bounds = CGRect(x: 0, y: 0, width: 3, height: bounds.height)
+                bar.position = CGPoint(x: 1.5 + CGFloat(i) * 5, y: 0)
+                bar.cornerRadius = 1.5
+                if animated {
+                    bar.transform = CATransform3DIdentity
+                    if bar.animation(forKey: "eq") == nil {
+                        let a = CABasicAnimation(keyPath: "transform.scale.y")
+                        a.fromValue = 0.25
+                        a.toValue = 1.0
+                        a.duration = [0.42, 0.55, 0.36][i % 3]
+                        a.autoreverses = true
+                        a.repeatCount = .infinity
+                        a.timeOffset = Double(i) * 0.17
+                        a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                        bar.add(a, forKey: "eq")
+                    }
+                } else {
+                    bar.removeAllAnimations()
+                    bar.transform = CATransform3DMakeScale(1, [0.55, 0.85, 0.4][i % 3], 1)
                 }
             }
-            .frame(height: 12, alignment: .bottom)
         }
+        CATransaction.commit()
     }
 }
 

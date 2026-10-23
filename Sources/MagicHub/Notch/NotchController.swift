@@ -286,6 +286,11 @@ final class NotchManager {
             .sink { [weak self] _ in self?.rebuild() }
             .store(in: &cancellables)
 
+        Prefs.shared.$lite.dropFirst().removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.startPolling() }
+            .store(in: &cancellables)
+
         Prefs.shared.$panelScale.dropFirst()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -346,11 +351,13 @@ final class NotchManager {
 
     private func startPolling() {
         pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+        let interval = Prefs.shared.lite ? 0.4 : 0.2
+        pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let self else { return }
             let p = NSEvent.mouseLocation
             if p != self.lastPoint { self.mouseMoved() }
         }
+        pollTimer?.tolerance = interval * 0.25
     }
 
     private func mouseMoved() {

@@ -28,7 +28,9 @@ final class SysMonitor: ObservableObject {
     /// true, пока открыт поповер — тогда же собираем процессы.
     var detailed = false {
         didSet {
-            if detailed && !oldValue { refreshNow() }
+            guard detailed != oldValue else { return }
+            if detailed { refreshNow() }
+            if Prefs.shared.lite { restart(interval: Prefs.shared.mbInterval) }
         }
     }
 
@@ -48,11 +50,11 @@ final class SysMonitor: ObservableObject {
         guard !started else { return }
         started = true
         restart(interval: Prefs.shared.mbInterval)
-        Prefs.shared.$mbInterval
-            .dropFirst()
-            .removeDuplicates()
+        Prefs.shared.$mbInterval.map { _ in () }
+            .merge(with: Prefs.shared.$lite.removeDuplicates().map { _ in () })
+            .dropFirst(2)
             .receive(on: RunLoop.main)
-            .sink { [weak self] v in self?.restart(interval: v) }
+            .sink { [weak self] in self?.restart(interval: Prefs.shared.mbInterval) }
             .store(in: &cancellables)
     }
 
@@ -63,7 +65,9 @@ final class SysMonitor: ObservableObject {
     private func restart(interval: Double) {
         timer?.cancel()
         let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now(), repeating: max(1, interval), leeway: .milliseconds(250))
+        // В экономном режиме — не чаще раза в 3 с (пока открыто окошко с подробностями, как задано).
+        let effective = Prefs.shared.lite && !detailed ? max(3, interval) : max(1, interval)
+        t.schedule(deadline: .now(), repeating: effective, leeway: .milliseconds(Prefs.shared.lite ? 1000 : 250))
         t.setEventHandler { [weak self] in self?.sample() }
         t.resume()
         timer = t

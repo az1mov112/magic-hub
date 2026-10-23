@@ -25,6 +25,11 @@ struct SettingsTabView: View {
                     }
                     SettingsToggleRow("Показывать значок в меню-баре", subtitle: "Сердечко справа: открыть панель, настройки, выход",
                                       isOn: $prefs.showMenuBarIcon)
+                    SettingsSegmentRow("Экономный режим",
+                                       subtitle: (prefs.lite ? "Сейчас включён" : "Сейчас выключен")
+                                           + ". Реже опросы датчиков и Джарвиса, без анимаций в чёлке. Авто — на Intel и в режиме энергосбережения",
+                                       options: [(PerfMode.auto, "Авто"), (PerfMode.on, "Вкл"), (PerfMode.off, "Выкл")],
+                                       selection: $prefs.perfMode)
                 }
 
                 SettingsSection("Чёлка") {

@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-private enum SysPopTab: Hashable { case system, power, fans }
+private enum SysPopTab: Hashable { case system, power, fans, boost }
 
 /// Окошко по клику на цифры в меню-баре.
 struct SystemPopoverView: View {
@@ -20,6 +20,7 @@ struct SystemPopoverView: View {
                 case .system: SysSystemTab(mon: mon)
                 case .power: SysPowerTab(mon: mon)
                 case .fans: SysFansTab(mon: mon, fans: fans)
+                case .boost: SysBoostTab(openFans: { tab = .fans })
                 }
             }
             footer
@@ -34,15 +35,19 @@ struct SystemPopoverView: View {
     private var tabOptions: [(SysPopTab, String)] {
         var o: [(SysPopTab, String)] = [(.system, "Система"), (.power, "Питание")]
         if fans.hasFans { o.append((.fans, "Вентиляторы")) }
+        o.append((.boost, "Ускорение"))
         return o
     }
 
     private var header: some View {
-        HStack(spacing: 10) {
-            SysLogo(size: 30)
-            Text("Magic Hub").font(.system(size: 14, weight: .semibold))
-            Spacer(minLength: 4)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                SysLogo(size: 30)
+                Text("Magic Hub").font(.system(size: 14, weight: .semibold))
+                Spacer(minLength: 4)
+            }
             MHSegmented(options: tabOptions, selection: $tab)
+                .frame(maxWidth: .infinity)
         }
     }
 

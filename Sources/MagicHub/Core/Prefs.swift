@@ -6,6 +6,7 @@ enum NotchStyle: String, CaseIterable { case auto, wide, cutout }
 enum AutoClean: String, CaseIterable { case off, days7, days30, count500 }
 enum CalendarSource: String, CaseIterable { case notion, mac }
 enum TranslateEngine: String, CaseIterable { case google, apple }
+enum PerfMode: String, CaseIterable { case auto, on, off }
 
 /// Все настройки приложения. Хранятся в UserDefaults, меняются из любых экранов.
 /// Секреты (токены) здесь не хранятся — только в Связке ключей (см. `Keychain`).
@@ -17,6 +18,16 @@ final class Prefs: ObservableObject {
     @Published var showMenuBarIcon: Bool = Prefs.bool("showMenuBarIcon", true) { didSet { Prefs.d.set(showMenuBarIcon, forKey: "showMenuBarIcon") } }
 
     @Published var autoUpdateCheck: Bool = Prefs.bool("autoUpdateCheck", true) { didSet { Prefs.d.set(autoUpdateCheck, forKey: "autoUpdateCheck") } }
+
+    /// Экономный режим: реже опросы, без анимаций в свёрнутой чёлке. «Авто» — на Intel и в режиме энергосбережения.
+    @Published var perfMode: PerfMode = Prefs.enumValue("perfMode", PerfMode.auto) {
+        didSet {
+            Prefs.d.set(perfMode.rawValue, forKey: "perfMode")
+            updateLite()
+        }
+    }
+    /// Экономный режим сейчас действует.
+    @Published private(set) var lite = false
 
     /// Свои индикаторы громкости и яркости в чёлке вместо системных.
     @Published var customHUD: Bool = Prefs.bool("customHUD", true) { didSet { Prefs.d.set(customHUD, forKey: "customHUD") } }
@@ -99,6 +110,19 @@ final class Prefs: ObservableObject {
     // MARK: Валюта
     @Published var currencyFrom: String = Prefs.string("currencyFrom", "USD") { didSet { Prefs.d.set(currencyFrom, forKey: "currencyFrom") } }
     @Published var currencyTo: String = Prefs.string("currencyTo", "RUB") { didSet { Prefs.d.set(currencyTo, forKey: "currencyTo") } }
+
+    init() {
+        updateLite()
+        NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { [weak self] _ in
+            self?.updateLite()
+        }
+    }
+
+    private func updateLite() {
+        let auto = !SysCtl.isAppleSilicon || ProcessInfo.processInfo.isLowPowerModeEnabled
+        let value = perfMode == .on || (perfMode == .auto && auto)
+        if lite != value { lite = value }
+    }
 
     // MARK: Вкладки
     func isVisible(_ tab: Tab) -> Bool { tab == .settings || !hiddenTabs.contains(tab.rawValue) }
