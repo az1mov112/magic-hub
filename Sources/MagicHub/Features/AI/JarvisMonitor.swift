@@ -24,12 +24,15 @@ struct JarvisState: Equatable {
     var waitingFirstReply = false
     var contextTokens: Int?
     var lastError: String?
+    var lastErrorCode: String?
     var lastErrorDate: Date?
     var errorsToday = 0
     var compactionsToday = 0
     var medianTurn: TimeInterval?
     var lastTurnDuration: TimeInterval?
     var restartsToday = 0
+
+    var lastIssue: JarvisIssue? { lastError.map { JarvisIssue.classify($0, code: lastErrorCode) } }
 
     /// Занят и тишина больше 10 минут — вероятно, завис.
     var hung: Bool {
@@ -171,6 +174,7 @@ final class JarvisMonitor: ObservableObject {
             s.waitingFirstReply = parse.waitingFirstReply
             s.contextTokens = parse.contextTokens
             s.lastError = parse.lastError
+            s.lastErrorCode = parse.lastErrorCode
             s.lastErrorDate = parse.lastErrorDate
             s.errorsToday = parse.errorsToday
             s.compactionsToday = parse.compactionsToday
@@ -228,6 +232,7 @@ final class JarvisMonitor: ObservableObject {
         var waitingFirstReply = false
         var contextTokens: Int?
         var lastError: String?
+        var lastErrorCode: String?
         var lastErrorDate: Date?
         var errorsToday = 0
         var compactionsToday = 0
@@ -269,7 +274,8 @@ final class JarvisMonitor: ObservableObject {
 
             if (obj["isApiErrorMessage"] as? Bool) == true || obj["error"] != nil {
                 let msg = Self.text(of: message?["content"]) ?? (obj["error"] as? String) ?? "Ошибка API"
-                r.lastError = String(msg.prefix(160))
+                r.lastError = String(msg.prefix(300))
+                r.lastErrorCode = obj["error"] as? String
                 r.lastErrorDate = date
                 if let date, cal.isDateInToday(date) { r.errorsToday += 1 }
             }
@@ -368,11 +374,10 @@ final class JarvisMonitor: ObservableObject {
         if let d = s.lastErrorDate, d > (seenErrorDate ?? .distantPast) {
             seenErrorDate = d
             if prefs.evError, Date().timeIntervalSince(d) < 900 {
-                let text = s.lastError ?? ""
-                let isLimit = text.lowercased().contains("limit")
-                AppModel.shared.post(NotchNotification(title: isLimit ? "Кончился лимит Claude" : "Ошибка у Джарвиса",
-                                                       subtitle: Self.short(text, 70),
-                                                       kind: isLimit ? .warning : .error))
+                let issue = JarvisIssue.classify(s.lastError ?? "", code: s.lastErrorCode)
+                AppModel.shared.post(NotchNotification(title: issue.title,
+                                                       subtitle: Self.short(issue.short, 70),
+                                                       kind: issue.kind == .limit || issue.kind == .context ? .warning : .error))
             }
         }
         if s.hung && !notifiedHang {
@@ -574,5 +579,61 @@ final class JarvisMonitor: ObservableObject {
     static func short(_ s: String, _ n: Int = 60) -> String {
         let one = s.replacingOccurrences(of: "\n", with: " ")
         return one.count > n ? String(one.prefix(n - 1)) + "…" : one
+    }
+}
+
+/// Понятное объяснение ошибок Claude Code. «Лимит» — только настоящий лимит подписки,
+/// а не любое сообщение со словом limit.
+struct JarvisIssue {
+    enum Kind { case limit, context, server, auth, network, other }
+
+    let kind: Kind
+    let title: String
+    /// Для уведомления в чёлке.
+    let short: String
+    /// Что случилось и что делать — для карточки.
+    let hint: String
+
+    static func classify(_ text: String, code: String?) -> JarvisIssue {
+        let t = text.lowercased()
+        let c = (code ?? "").lowercased()
+        func has(_ keys: String...) -> Bool { keys.contains { t.contains($0) } }
+
+        if has("autocompact is thrashing") {
+            return JarvisIssue(kind: .context, title: "Контекст переполняется",
+                               short: "Не лимит: контекст забивается сразу после сжатия",
+                               hint: "Это не лимит подписки. После сжатия контекст снова заполнился за 3 хода, и так 3 раза подряд — Claude Code перестал сжимать его сам. Когда Джарвис свободен, нажмите «Мягкий перезапуск»: он начнёт свежую сессию.")
+        }
+        if has("prompt is too long", "context window", "context_length", "too many tokens") {
+            return JarvisIssue(kind: .context, title: "Контекст переполнен",
+                               short: "Нужна свежая сессия — мягкий перезапуск",
+                               hint: "Разговор больше не помещается в контекст модели. Когда Джарвис свободен, нажмите «Мягкий перезапуск».")
+        }
+        if c == "rate_limit" || has("usage limit", "limit reached", "hit your limit", "rate_limit", "rate limit", "weekly limit") {
+            return JarvisIssue(kind: .limit, title: "Кончился лимит Claude",
+                               short: "Джарвис продолжит после сброса лимита",
+                               hint: "Лимит подписки исчерпан. Когда он сбросится — видно на карточке Claude.")
+        }
+        if c == "billing_error" || has("credit balance", "billing") {
+            return JarvisIssue(kind: .limit, title: "Проблема с оплатой Claude",
+                               short: "Проверьте подписку на claude.ai",
+                               hint: "Claude отказал из‑за оплаты. Проверьте подписку на claude.ai.")
+        }
+        if c == "authentication_failed" || has("/login", "oauth token", "invalid api key", "api error: 401", "authentication_error") {
+            return JarvisIssue(kind: .auth, title: "Джарвис потерял вход в Claude",
+                               short: "Нужно заново войти в Claude Code",
+                               hint: "Токен входа истёк или отозван — Джарвису нужно заново войти в Claude Code, затем перезапустить его.")
+        }
+        if c == "server_error" || has("overloaded", "api error: 5", "internal server error") {
+            return JarvisIssue(kind: .server, title: "Сбой на стороне Claude",
+                               short: "Серверы Anthropic перегружены, лимит ни при чём",
+                               hint: "Временная проблема у Anthropic, ваш лимит ни при чём. Обычно проходит сама за несколько минут.")
+        }
+        if has("connection error", "timed out", "timeout", "econnreset", "enotfound", "fetch failed", "network") {
+            return JarvisIssue(kind: .network, title: "Нет связи с Claude",
+                               short: "Проверьте интернет",
+                               hint: "Запрос к Claude не дошёл. Проверьте интернет — кнопка с глобусом внизу замерит сеть.")
+        }
+        return JarvisIssue(kind: .other, title: "Ошибка у Джарвиса", short: text, hint: text)
     }
 }

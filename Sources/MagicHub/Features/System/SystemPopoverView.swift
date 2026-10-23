@@ -54,7 +54,7 @@ struct SystemPopoverView: View {
             }
             .buttonStyle(MHButtonStyle())
             Button(action: onActivityMonitor) {
-                Label("Мониторинг системы", systemImage: "arrow.up.forward.app")
+                Label("Мониторинг", systemImage: "arrow.up.forward.app")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(MHButtonStyle())

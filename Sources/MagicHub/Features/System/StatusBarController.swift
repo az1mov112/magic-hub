@@ -2,13 +2,40 @@ import AppKit
 import SwiftUI
 import Combine
 
+/// Окошко под цифрами в меню-баре. Своё окно вместо NSPopover: NSPopover при изменении
+/// размера содержимого (раскрыли список, сменили вкладку) улетал к левому краю экрана.
+private final class SystemPanel: NSPanel {
+    init() {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 340, height: 400),
+                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        isFloatingPanel = true
+        level = .popUpMenu
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+        backgroundColor = .clear
+        isOpaque = false
+        hasShadow = true
+        isMovable = false
+        hidesOnDeactivate = false
+        isReleasedWhenClosed = false
+        animationBehavior = .utilityWindow
+    }
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 /// Цифры справа в меню-баре (CPU, температура, память, батарея, вентилятор).
 /// Клик — окошко с подробностями «Система / Питание / Вентиляторы».
-final class StatusBarController: NSObject, NSPopoverDelegate {
+final class StatusBarController: NSObject {
     static let shared = StatusBarController()
 
     private var item: NSStatusItem?
-    private let popover = NSPopover()
+    private let panel = SystemPanel()
+    /// Верхний край и центр окошка — фиксируются при открытии, при смене высоты не двигаются.
+    private var anchorTop: CGFloat = 0
+    private var anchorMidX: CGFloat = 0
+    private var contentHeight: CGFloat = 0
+    private var monitors: [Any] = []
     private var cancellables = Set<AnyCancellable>()
     private var started = false
 
@@ -27,23 +54,32 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             button.setAccessibilityLabel("Показатели системы Magic Hub")
         }
 
-        popover.behavior = .transient
-        popover.animates = true
-        popover.delegate = self
-        popover.appearance = NSAppearance(named: .darkAqua)
-        let host = NSHostingController(rootView: SystemPopoverView(
+        let content = SystemPopoverView(
             onSettings: { [weak self] in
-                self?.popover.performClose(nil)
+                self?.closePanel()
                 AppModel.shared.open(.settings)
             },
             onActivityMonitor: { [weak self] in
-                self?.popover.performClose(nil)
+                self?.closePanel()
                 let url = URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app")
                 NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
             }
-        ))
-        host.sizingOptions = [.preferredContentSize]
-        popover.contentViewController = host
+        )
+        .fixedSize(horizontal: false, vertical: true)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.white.opacity(0.09), lineWidth: 1))
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { [weak self] size in
+            self?.contentSizeChanged(size)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        let host = NSHostingView(rootView: content)
+        host.sizingOptions = []
+        panel.contentView = host
+
+        _ = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                   object: nil, queue: .main) { [weak self] _ in self?.closePanel() }
+        _ = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification,
+                                                              object: nil, queue: .main) { [weak self] _ in self?.closePanel() }
 
         FanController.shared.recoverIfNeeded()
         SysMonitor.shared.start()
@@ -69,19 +105,65 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func togglePopover(_ sender: Any?) {
-        if popover.isShown {
-            popover.performClose(sender)
+        if panel.isVisible {
+            closePanel()
             return
         }
-        guard let button = item?.button else { return }
+        guard let button = item?.button, let window = button.window else { return }
+        let anchor = window.convertToScreen(button.convert(button.bounds, to: nil))
+        anchorTop = anchor.minY - 5
+        anchorMidX = anchor.midX
         SysMonitor.shared.detailed = true
-        NSApp.activate()
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
+        place(height: contentHeight > 1 ? contentHeight : 420)
+        panel.makeKeyAndOrderFront(nil)
+        installMonitors()
     }
 
-    func popoverDidClose(_ notification: Notification) {
+    private func closePanel() {
+        guard panel.isVisible else { return }
+        panel.orderOut(nil)
+        monitors.forEach(NSEvent.removeMonitor)
+        monitors.removeAll()
         SysMonitor.shared.detailed = false
+    }
+
+    /// Высота меняется — верхний край остаётся под цифрами, окошко растёт вниз.
+    private func contentSizeChanged(_ size: CGSize) {
+        guard size.height > 1 else { return }
+        contentHeight = ceil(size.height)
+        if panel.isVisible, abs(contentHeight - panel.frame.height) > 0.5 {
+            place(height: contentHeight)
+        }
+    }
+
+    private func place(height: CGFloat) {
+        let width: CGFloat = 340
+        let h = ceil(height)
+        let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: anchorMidX, y: anchorTop)) } ?? NSScreen.main
+        var x = anchorMidX - width / 2
+        if let vf = screen?.visibleFrame {
+            x = min(max(x, vf.minX + 6), vf.maxX - width - 6)
+        }
+        panel.setFrame(NSRect(x: round(x), y: anchorTop - h, width: width, height: h), display: true)
+        panel.invalidateShadow()
+    }
+
+    /// Клик мимо окошка или Esc — закрыть, как у обычного всплывающего окна.
+    private func installMonitors() {
+        guard monitors.isEmpty else { return }
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] _ in
+            self?.closePanel()
+        }) { monitors.append(m) }
+        if let m = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown], handler: { [weak self] event in
+            guard let self else { return event }
+            if event.type == .keyDown {
+                if event.keyCode == 53, self.panel.isKeyWindow { self.closePanel(); return nil }
+                return event
+            }
+            // Клик по самим цифрам закроет окошко через togglePopover.
+            if event.window !== self.panel, event.window !== self.item?.button?.window { self.closePanel() }
+            return event
+        }) { monitors.append(m) }
     }
 
     // MARK: - Картинка в меню-баре
@@ -104,6 +186,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             cols.append(("FAN", s.fans.first.map { "\(Int($0.actual))" } ?? "—"))
         }
         if cols.isEmpty {
+            closePanel()
             item.isVisible = false
             return
         }

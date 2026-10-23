@@ -31,7 +31,7 @@ jobs:
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: |
           if [ -z "$MACOS_CERT_PASSWORD" ]; then
-            echo "::warning::Секрет MACOS_CERT_PASSWORD не задан — подпись ad-hoc, разрешения macOS будут сбрасываться после каждого обновления"
+            echo "::warning::Секрет MACOS_CERT_PASSWORD не задан — подпись ad-hoc, сборка не публикуется в Releases (иначе у всех сбросятся разрешения macOS)"
             exit 0
           fi
           KC="$RUNNER_TEMP/signing.keychain-db"
@@ -46,10 +46,14 @@ jobs:
           echo "Сертификат: $HASH"
           [ -n "$HASH" ] && echo "SIGN_IDENTITY=$HASH" >> "$GITHUB_ENV"
 
+      - name: Номер сборки
+        # +13: нумерация продолжает первые 13 сборок, чтобы уже установленные копии видели обновление.
+        run: |
+          B=$((GITHUB_RUN_NUMBER + 13))
+          echo "BUILD_NUMBER=$B" >> "$GITHUB_ENV"
+          echo "VERSION=0.1.$B" >> "$GITHUB_ENV"
+
       - name: Сборка Magic Hub.app
-        env:
-          VERSION: 0.1.${{ github.run_number }}
-          BUILD_NUMBER: ${{ github.run_number }}
         run: |
           # Без гигантских строк команд компилятора — только понятные ошибки.
           set -o pipefail
@@ -63,13 +67,14 @@ jobs:
           retention-days: 14
 
       - name: Свежая сборка в Releases (nightly)
+        if: env.SIGN_IDENTITY != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TITLE="Magic Hub — свежая сборка (0.1.${{ github.run_number }})"
+          TITLE="Magic Hub — свежая сборка ($VERSION)"
           NOTES="Автосборка из ветки ${GITHUB_REF_NAME}, коммит ${GITHUB_SHA::7}. Как установить — docs/INSTALL.md.
 
-          build: ${{ github.run_number }}"
+          build: $BUILD_NUMBER"
           # Тег переносим на текущий коммит, релиз обновляем на месте — без момента, когда его нет.
           git tag -f nightly "${GITHUB_SHA}"
           git push -f origin refs/tags/nightly

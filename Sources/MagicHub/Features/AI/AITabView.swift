@@ -79,8 +79,13 @@ private struct AIJarvisCard: View {
                         AIRow(label: "Telegram", value: pollerText(s.pollers), color: s.pollers == 1 ? MH.green : MH.red)
                         contextRow(s)
                         AIRow(label: "Ошибки сегодня", value: s.errorsToday == 0 ? "нет" : "\(s.errorsToday)", color: s.errorsToday == 0 ? MH.t1 : MH.orange)
-                        if let e = s.lastError, let d = s.lastErrorDate, Date().timeIntervalSince(d) < 6 * 3600 {
-                            Text("\(Fmt.ago(d)): \(e)").font(.system(size: 11)).foregroundStyle(MH.orange).lineLimit(2)
+                        if let e = s.lastError, let issue = s.lastIssue, let d = s.lastErrorDate, Date().timeIntervalSince(d) < 6 * 3600 {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(Fmt.ago(d)): \(issue.title)").font(.system(size: 11, weight: .semibold)).foregroundStyle(MH.orange)
+                                Text(issue.hint).font(.system(size: 11)).foregroundStyle(MH.t2).lineLimit(4)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .help(e)
                         }
                         AIRow(label: "Перезапуски сегодня", value: "\(s.restartsToday)")
                         AIRow(label: "Медиана хода", value: s.medianTurn.map(Fmt.duration) ?? "—",
