@@ -1,0 +1,23 @@
+# Секреты и личные данные — никогда не коммитить
+.env
+.env.*
+*.env
+**/channels/telegram/
+access.json
+*token*
+*secret*
+*.jsonl
+memory/
+logs/
+*.log
+
+# macOS / сборка
+.DS_Store
+build/
+DerivedData/
+dist/
+*.app
+*.dmg
+node_modules/
+.venv/
+__pycache__/
