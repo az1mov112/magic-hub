@@ -1,9 +1,10 @@
 name: Build
 
+# Сборки — из рабочих веток; main — витрина репозитория (README), её обновление не выпускает версию заново.
 on:
   push:
-    branches: ["main", "claude/**"]
-    paths-ignore: ["docs/**", "**.md"]
+    branches: ["claude/**"]
+    paths-ignore: ["docs/**", "**.md", "scripts/promo/**"]
   workflow_dispatch:
 
 permissions:
@@ -71,8 +72,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TITLE="Magic Hub — свежая сборка ($VERSION)"
-          NOTES="Автосборка из ветки ${GITHUB_REF_NAME}, коммит ${GITHUB_SHA::7}. Как установить — docs/INSTALL.md.
+          TITLE="Magic Hub $VERSION"
+          NOTES="### Как установить
+          1. Скачайте **MagicHub.zip** ниже и распакуйте двойным кликом.
+          2. Перетащите **Magic Hub** в «Программы».
+          3. Первый запуск:  → Системные настройки → Конфиденциальность и безопасность → «Всё равно открыть».
+
+          Уже установлен? Magic Hub обновится сам — нажмите на уведомление в чёлке.
+
+          macOS 15+, Apple Silicon и Intel. Подробнее — [README](https://github.com/az1mov112/magic-hub#readme).
+
+          <sub>Сборка из ${GITHUB_REF_NAME} · ${GITHUB_SHA::7}</sub>
 
           build: $BUILD_NUMBER"
           # Тег переносим на текущий коммит, релиз обновляем на месте — без момента, когда его нет.
@@ -80,7 +90,7 @@ jobs:
           git push -f origin refs/tags/nightly
           if gh release view nightly > /dev/null 2>&1; then
             gh release upload nightly build/MagicHub.zip --clobber
-            gh release edit nightly --title "$TITLE" --notes "$NOTES" --prerelease
+            gh release edit nightly --title "$TITLE" --notes "$NOTES" --prerelease=false --latest
           else
-            gh release create nightly build/MagicHub.zip --prerelease --title "$TITLE" --notes "$NOTES"
+            gh release create nightly build/MagicHub.zip --latest --title "$TITLE" --notes "$NOTES"
           fi
