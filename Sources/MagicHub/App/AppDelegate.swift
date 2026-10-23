@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AwakeController.shared.shutdown()
         FanController.shared.restoreAutomatic()
         NowPlayingModel.shared.stop()
+        ClaudeUsageMonitor.shared.flush()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

@@ -289,6 +289,7 @@ final class JarvisMonitor: ObservableObject {
         var turns: [Double] = []
         var replyAfterTask: Date?
         var index = 0
+        var lastDate: Date?
 
         for line in lines {
             index += 1
@@ -297,6 +298,24 @@ final class JarvisMonitor: ObservableObject {
             let type = obj["type"] as? String ?? ""
             let date = (obj["timestamp"] as? String).flatMap(Self.parseDate)
             let message = obj["message"] as? [String: Any]
+            if let date { lastDate = date }
+
+            // Сообщение из Telegram Claude Code пишет по-разному: обычной репликой, вложением
+            // (пришло посреди хода), записью очереди или last-prompt. Ищем строку, которая начинается с <channel.
+            if type != "assistant", line.contains("<channel"),
+               !(type == "user" && Self.isToolResult(message?["content"])),
+               let task = Self.findChannel(obj) {
+                let when = date ?? lastDate
+                let isNew = task != r.lastTask
+                    || (when.map { w in r.lastTaskDate.map { w.timeIntervalSince($0) > 60 } ?? true } ?? false)
+                if isNew {
+                    r.lastTask = task
+                    r.lastTaskDate = when
+                    replyAfterTask = nil
+                } else if r.lastTaskDate == nil {
+                    r.lastTaskDate = when
+                }
+            }
 
             if (obj["isApiErrorMessage"] as? Bool) == true || obj["error"] != nil {
                 let msg = Self.text(of: message?["content"]) ?? (obj["error"] as? String) ?? "Ошибка API"
@@ -314,20 +333,6 @@ final class JarvisMonitor: ObservableObject {
                     break
                 }
                 lastActivityIndex = index
-                if let t = Self.text(of: content), let task = Self.channelText(t) {
-                    r.lastTask = task
-                    r.lastTaskDate = date
-                    replyAfterTask = nil
-                }
-            case "attachment":
-                // Сообщение, пришедшее посреди хода, Claude Code записывает вложением (queued_command).
-                if let att = obj["attachment"] as? [String: Any],
-                   let t = (att["prompt"] as? String) ?? Self.text(of: att["prompt"]) ?? Self.text(of: att["content"]),
-                   let task = Self.channelText(t) {
-                    r.lastTask = task
-                    r.lastTaskDate = date
-                    replyAfterTask = nil
-                }
             case "assistant":
                 lastActivityIndex = index
                 if let usage = message?["usage"] as? [String: Any] {
@@ -764,6 +769,23 @@ final class JarvisMonitor: ObservableObject {
                 (b["type"] as? String) == "text" ? b["text"] as? String : nil
             }
             return texts.isEmpty ? nil : texts.joined(separator: "\n")
+        }
+        return nil
+    }
+
+    /// Первая строка внутри записи, которая начинается с <channel, — текст сообщения из Telegram.
+    /// Инструкции плагина упоминают <channel> посреди текста — они не подходят.
+    static func findChannel(_ value: Any, depth: Int = 0) -> String? {
+        if depth > 6 { return nil }
+        if let s = value as? String {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.hasPrefix("<channel") ? channelText(t) : nil
+        }
+        if let d = value as? [String: Any] {
+            for (_, v) in d { if let r = findChannel(v, depth: depth + 1) { return r } }
+        }
+        if let a = value as? [Any] {
+            for v in a.reversed() { if let r = findChannel(v, depth: depth + 1) { return r } }
         }
         return nil
     }

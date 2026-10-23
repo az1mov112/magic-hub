@@ -9,7 +9,7 @@ struct ClaudeLimit: Identifiable, Equatable {
     let resetsAt: Date?
 }
 
-struct UsageTotals: Equatable {
+struct UsageTotals: Equatable, Codable {
     var input: Double = 0
     var output: Double = 0
     var cacheWrite: Double = 0
@@ -51,10 +51,43 @@ final class ClaudeUsageMonitor: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
 
     // Состояние инкрементального сканирования (только на queue).
+    // Сохраняется между запусками: журналы Claude Code за месяц — это сотни мегабайт,
+    // перечитывать их после каждого обновления приложения слишком дорого.
     private var offsets: [String: UInt64] = [:]
     private var seenIDs = Set<String>()
     private var byDay: [String: UsageTotals] = [:]
     private var monthKey = ""
+    private var cacheLoaded = false
+    private var cacheDirty = false
+    private var cacheSaved = Date.distantPast
+
+    private struct UsageCache: Codable {
+        var monthKey: String
+        var offsets: [String: UInt64]
+        var seenIDs: [String]
+        var byDay: [String: UsageTotals]
+    }
+
+    private static let cacheURL = AppPaths.file("claude-usage-cache.json")
+
+    private func loadCache() {
+        cacheLoaded = true
+        guard let data = try? Data(contentsOf: Self.cacheURL),
+              let c = try? JSONDecoder().decode(UsageCache.self, from: data) else { return }
+        monthKey = c.monthKey
+        offsets = c.offsets
+        seenIDs = Set(c.seenIDs)
+        byDay = c.byDay
+    }
+
+    private func saveCache(force: Bool = false) {
+        guard cacheDirty, force || Date().timeIntervalSince(cacheSaved) > 300 else { return }
+        let c = UsageCache(monthKey: monthKey, offsets: offsets, seenIDs: Array(seenIDs), byDay: byDay)
+        guard let data = try? JSONEncoder().encode(c) else { return }
+        try? data.write(to: Self.cacheURL, options: .atomic)
+        cacheDirty = false
+        cacheSaved = Date()
+    }
 
     func start() {
         refreshUsage()
@@ -75,6 +108,11 @@ final class ClaudeUsageMonitor: ObservableObject {
         let interval: TimeInterval = Prefs.shared.lite ? 180 : 45
         usageTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in self?.refreshUsage() }
         usageTimer?.tolerance = interval * 0.2
+    }
+
+    /// При выходе из приложения — сохранить, докуда дочитаны журналы.
+    func flush() {
+        queue.sync { saveCache(force: true) }
     }
 
     func refreshAll() {
@@ -179,11 +217,13 @@ final class ClaudeUsageMonitor: ObservableObject {
         let now = Date()
         let cal = Calendar.current
         let mk = String(Self.dayFormatter.string(from: now).prefix(7))
+        if !cacheLoaded { loadCache() }
         if mk != monthKey {   // новый месяц — считаем заново
             monthKey = mk
             offsets = [:]
             seenIDs = []
             byDay = [:]
+            cacheDirty = true
         }
         let startOfMonth = cal.date(from: cal.dateComponents([.year, .month], from: now)) ?? now
         let root = AppPaths.home.appendingPathComponent(".claude/projects")
@@ -198,63 +238,90 @@ final class ClaudeUsageMonitor: ObservableObject {
                   let mtime = v.contentModificationDate, mtime >= startOfMonth else { continue }
             let size = UInt64(v.fileSize ?? 0)
             let path = url.path
-            let from = offsets[path] ?? 0
+            var from = offsets[path] ?? 0
+            if size < from { from = 0 }   // файл перезаписан — дочитаем заново, повторы отсеет seenIDs
             if size > from {
                 offsets[path] = readUsage(url, from: from, to: size, monthStart: startOfMonth)
+                cacheDirty = true
             }
             if now.timeIntervalSince(mtime) < 180, !path.contains("/subagents/") {
                 active.append(sessionInfo(url, mtime: mtime, isJarvis: path == jarvisFile))
             }
         }
+        saveCache()
         let todayTotals = byDay[Self.dayFormatter.string(from: now)] ?? UsageTotals()
         let monthTotals = byDay.filter { $0.key.hasPrefix(mk) }.values.reduce(UsageTotals(), +)
         active.sort { $0.lastActivity > $1.lastActivity }
         return (todayTotals, monthTotals, Array(active.prefix(5)))
     }
 
-    /// Читает новые полные строки файла, возвращает смещение, до которого дочитано.
+    private static let usageKey = Data("\"usage\"".utf8)
+    private static let assistantKey = Data("\"type\":\"assistant\"".utf8)
+
+    /// Читает новые полные строки файла кусками по 4 МБ, возвращает смещение, до которого дочитано.
     private func readUsage(_ url: URL, from: UInt64, to: UInt64, monthStart: Date) -> UInt64 {
         guard let h = try? FileHandle(forReadingFrom: url) else { return from }
         defer { try? h.close() }
         try? h.seek(toOffset: from)
-        guard let data = try? h.read(upToCount: Int(to - from)), !data.isEmpty else { return from }
-        guard let lastNewline = data.lastIndex(of: 0x0A) else { return from }
-        let complete = data[data.startIndex...lastNewline]
-        for line in complete.split(separator: 0x0A) {
-            // Быстрый отсев: нас интересуют только ответы модели с usage.
-            guard line.count > 50, let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-                  (obj["type"] as? String) == "assistant",
-                  let message = obj["message"] as? [String: Any],
-                  let usage = message["usage"] as? [String: Any],
-                  let model = message["model"] as? String, model != "<synthetic>" else { continue }
-            let id = (message["id"] as? String ?? "") + ":" + (obj["requestId"] as? String ?? "")
-            if id.count > 1 {
-                if seenIDs.contains(id) { continue }
-                seenIDs.insert(id)
+        var consumed = from          // до сюда разобраны целые строки
+        var readPos = from           // до сюда прочитано
+        var carry = Data()
+        while readPos < to {
+            let want = Int(min(UInt64(4 * 1024 * 1024), to - readPos))
+            guard let data = try? h.read(upToCount: want), !data.isEmpty else { break }
+            readPos += UInt64(data.count)
+            carry.append(data)
+            guard let lastNewline = carry.lastIndex(of: 0x0A) else {
+                if carry.count > 64 * 1024 * 1024 {   // гигантская строка без конца — пропускаем
+                    consumed += UInt64(carry.count)
+                    carry = Data()
+                }
+                continue
             }
-            guard let ts = (obj["timestamp"] as? String).flatMap(JarvisMonitor.parseDate), ts >= monthStart else { continue }
-
-            let num: (String) -> Double = { key in
-                if let d = usage[key] as? Double { return d }
-                if let i = usage[key] as? Int { return Double(i) }
-                return 0
+            let complete = carry[carry.startIndex...lastNewline]
+            for line in complete.split(separator: 0x0A) {
+                // Быстрый отсев без разбора JSON: нужны только ответы модели с usage.
+                guard line.range(of: Self.usageKey) != nil, line.range(of: Self.assistantKey) != nil else { continue }
+                consumeUsage(Data(line), monthStart: monthStart)
             }
-            let input = num("input_tokens")
-            let output = num("output_tokens")
-            let read = num("cache_read_input_tokens")
-            let write = num("cache_creation_input_tokens")
-            var write5m = write, write1h = 0.0
-            if let cc = usage["cache_creation"] as? [String: Any] {
-                let a = (cc["ephemeral_5m_input_tokens"] as? Double) ?? Double((cc["ephemeral_5m_input_tokens"] as? Int) ?? 0)
-                let b = (cc["ephemeral_1h_input_tokens"] as? Double) ?? Double((cc["ephemeral_1h_input_tokens"] as? Int) ?? 0)
-                if a + b > 0 { write5m = a; write1h = b }
-            }
-            let p = Self.price(model)
-            let cost = (input * p.input + output * p.output + read * p.read + write5m * p.input * 1.25 + write1h * p.input * 2) / 1_000_000
-            let day = Self.dayFormatter.string(from: ts)
-            byDay[day, default: UsageTotals()] = byDay[day, default: UsageTotals()] + UsageTotals(input: input, output: output, cacheWrite: write, cacheRead: read, cost: cost)
+            consumed += UInt64(complete.count)
+            carry = Data(carry[carry.index(after: lastNewline)...])
         }
-        return from + UInt64(complete.count)
+        return consumed
+    }
+
+    private func consumeUsage(_ line: Data, monthStart: Date) {
+        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              (obj["type"] as? String) == "assistant",
+              let message = obj["message"] as? [String: Any],
+              let usage = message["usage"] as? [String: Any],
+              let model = message["model"] as? String, model != "<synthetic>" else { return }
+        let id = (message["id"] as? String ?? "") + ":" + (obj["requestId"] as? String ?? "")
+        if id.count > 1 {
+            if seenIDs.contains(id) { return }
+            seenIDs.insert(id)
+        }
+        guard let ts = (obj["timestamp"] as? String).flatMap(JarvisMonitor.parseDate), ts >= monthStart else { return }
+
+        let num: (String) -> Double = { key in
+            if let d = usage[key] as? Double { return d }
+            if let i = usage[key] as? Int { return Double(i) }
+            return 0
+        }
+        let input = num("input_tokens")
+        let output = num("output_tokens")
+        let read = num("cache_read_input_tokens")
+        let write = num("cache_creation_input_tokens")
+        var write5m = write, write1h = 0.0
+        if let cc = usage["cache_creation"] as? [String: Any] {
+            let a = (cc["ephemeral_5m_input_tokens"] as? Double) ?? Double((cc["ephemeral_5m_input_tokens"] as? Int) ?? 0)
+            let b = (cc["ephemeral_1h_input_tokens"] as? Double) ?? Double((cc["ephemeral_1h_input_tokens"] as? Int) ?? 0)
+            if a + b > 0 { write5m = a; write1h = b }
+        }
+        let p = Self.price(model)
+        let cost = (input * p.input + output * p.output + read * p.read + write5m * p.input * 1.25 + write1h * p.input * 2) / 1_000_000
+        let day = Self.dayFormatter.string(from: ts)
+        byDay[day, default: UsageTotals()] = byDay[day, default: UsageTotals()] + UsageTotals(input: input, output: output, cacheWrite: write, cacheRead: read, cost: cost)
     }
 
     /// Цены API, USD за 1 млн токенов (input, output, cache read). Запись в кэш: 1,25× (5 мин) и 2× (1 ч) от input.
