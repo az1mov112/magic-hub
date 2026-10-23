@@ -31,6 +31,8 @@ struct JarvisState: Equatable {
     var medianTurn: TimeInterval?
     var lastTurnDuration: TimeInterval?
     var restartsToday = 0
+    /// Основной ход закончен, но фоновые агенты ещё пишут свои журналы.
+    var background = false
 
     var lastIssue: JarvisIssue? { lastError.map { JarvisIssue.classify($0, code: lastErrorCode) } }
 
@@ -168,6 +170,11 @@ final class JarvisMonitor: ObservableObject {
             let parse = parseSession(file)
             s.busy = parse.busy
             s.lastActivity = parse.lastActivity
+            if let bg = Self.lastBackgroundWrite(forProject: dir, session: file), Date().timeIntervalSince(bg) < 90 {
+                s.background = !parse.busy
+                s.busy = true
+                if bg > (s.lastActivity ?? .distantPast) { s.lastActivity = bg }
+            }
             s.currentTask = parse.lastTask
             s.taskStarted = parse.lastTaskDate
             s.firstReplyLatency = parse.firstReplyLatency
@@ -511,11 +518,31 @@ final class JarvisMonitor: ObservableObject {
     static func latestSessionFile(forProject path: String) -> URL? {
         let dir = projectDir(for: path)
         let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-        return files.filter { $0.pathExtension == "jsonl" }.max { a, b in
+        return files.filter { $0.pathExtension == "jsonl" && !$0.lastPathComponent.hasPrefix("agent-") }.max { a, b in
             let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return da < db
         }
+    }
+
+    /// Фоновые агенты пишут журналы отдельно: `<сессия>/subagents/*.jsonl`
+    /// (в старых версиях Claude Code — `agent-*.jsonl` рядом с сессией). Время последней записи.
+    static func lastBackgroundWrite(forProject path: String, session: URL) -> Date? {
+        let dir = projectDir(for: path)
+        let fm = FileManager.default
+        var latest: Date?
+        func consider(_ url: URL) {
+            guard url.pathExtension == "jsonl",
+                  let d = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else { return }
+            if d > (latest ?? .distantPast) { latest = d }
+        }
+        let sessionDir = dir.appendingPathComponent(session.deletingPathExtension().lastPathComponent)
+        if let e = fm.enumerator(at: sessionDir, includingPropertiesForKeys: [.contentModificationDateKey]) {
+            for case let url as URL in e { consider(url) }
+        }
+        let top = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        for url in top where url.lastPathComponent.hasPrefix("agent-") { consider(url) }
+        return latest
     }
 
     static func tail(of url: URL, bytes: Int) -> String? {

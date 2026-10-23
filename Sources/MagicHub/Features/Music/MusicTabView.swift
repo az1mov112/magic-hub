@@ -89,6 +89,7 @@ struct MusicTabView: View {
         }
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.easeInOut(duration: 0.25), value: np.title)
     }
 
     private var stateLine: String {
@@ -107,17 +108,21 @@ private struct MusicCover: View {
 
     var body: some View {
         ZStack {
+            RoundedRectangle(cornerRadius: 16).fill(Color(hex: "3B2F5C"))
             if let image {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
+                    .id(ObjectIdentifier(image))
+                    .transition(.opacity)
             } else {
-                RoundedRectangle(cornerRadius: 16).fill(Color(hex: "3B2F5C"))
                 Image(systemName: "music.note")
                     .font(.system(size: 52, weight: .light))
                     .foregroundStyle(Color.white.opacity(0.85))
+                    .transition(.opacity)
             }
         }
+        .animation(.easeInOut(duration: 0.3), value: image.map { ObjectIdentifier($0) })
         .clipShape(RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(MH.line, lineWidth: 1))
     }

@@ -31,6 +31,12 @@ final class NowPlayingModel: ObservableObject {
     private var lastLaunch = Date.distantPast
     private var relaunchScheduled = false
     private let ioQueue = DispatchQueue(label: "app.magichub.nowplaying.io")
+    /// Между треками источник на долю секунды присылает «пусто» или паузу — такое состояние
+    /// придерживаем, чтобы чёлка и вкладка не мигали. Настоящая пауза применится через миг.
+    private var held: (o: [String: Any], artwork: NSImage?, mode: Int)?
+    private var holdWork: DispatchWorkItem?
+    /// Новый трек пришёл без обложки — старую убираем не сразу: обложка обычно догоняет.
+    private var artworkClearWork: DispatchWorkItem?
 
     private var scriptURL: URL? { Bundle.main.resourceURL?.appendingPathComponent("mediaremote.pl") }
     private var libraryURL: URL? { Bundle.main.resourceURL?.appendingPathComponent("libMediaRemoteBridge.dylib") }
@@ -136,11 +142,39 @@ final class NowPlayingModel: ObservableObject {
         if buffer.count > 8_000_000 { buffer.removeAll() }   // защита от мусора без переводов строки
     }
 
-    private func apply(_ o: [String: Any], artwork newArtwork: NSImage?, artworkMode: Int) {
+    private func apply(_ o: [String: Any], artwork incomingArtwork: NSImage?, artworkMode incomingMode: Int, force: Bool = false) {
         func num(_ key: String) -> Double { (o[key] as? NSNumber)?.doubleValue ?? 0 }
 
+        // Обложка могла прийти в придержанном сообщении, а это лишь говорит «не изменилась».
+        var newArtwork = incomingArtwork
+        var artworkMode = incomingMode
+        if artworkMode == 1, let h = held, h.mode == 2 {
+            newArtwork = h.artwork
+            artworkMode = 2
+        }
+
         let newTitle = (o["title"] as? String) ?? ""
-        if title != newTitle { title = newTitle }
+        let reportedPlaying = (o["isPlaying"] as? Bool) ?? (num("playbackRate") > 0)
+        if !force, isPlaying, hasContent, newTitle.isEmpty || !reportedPlaying {
+            held = (o, newArtwork, artworkMode)
+            if holdWork == nil {
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self, let h = self.held else { return }
+                    self.holdWork = nil
+                    self.held = nil
+                    self.apply(h.o, artwork: h.artwork, artworkMode: h.mode, force: true)
+                }
+                holdWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
+            }
+            return
+        }
+        holdWork?.cancel()
+        holdWork = nil
+        held = nil
+
+        let titleChanged = title != newTitle
+        if titleChanged { title = newTitle }
         let newArtist = (o["artist"] as? String) ?? ""
         if artist != newArtist { artist = newArtist }
         let newAlbum = (o["album"] as? String) ?? ""
@@ -160,9 +194,25 @@ final class NowPlayingModel: ObservableObject {
         if isPlaying != playing { isPlaying = playing }
 
         switch artworkMode {
-        case 2: artwork = newArtwork
-        case 1: break
-        default: if artwork != nil { artwork = nil }
+        case 2:
+            artworkClearWork?.cancel()
+            artworkClearWork = nil
+            artwork = newArtwork
+        case 1:
+            break
+        default:
+            if artwork != nil && artworkClearWork == nil {
+                if titleChanged && !newTitle.isEmpty {
+                    let work = DispatchWorkItem { [weak self] in
+                        self?.artworkClearWork = nil
+                        self?.artwork = nil
+                    }
+                    artworkClearWork = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+                } else {
+                    artwork = nil
+                }
+            }
         }
 
         let parent = (o["parentBundleId"] as? String).flatMap { $0.isEmpty ? nil : $0 }

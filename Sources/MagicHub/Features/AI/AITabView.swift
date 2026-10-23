@@ -114,7 +114,7 @@ private struct AIJarvisCard: View {
         } else if s.hung {
             StatusPill(text: "Завис?", color: MH.red, pulse: true)
         } else if s.busy {
-            StatusPill(text: "Занят", color: MH.yellow, pulse: true)
+            StatusPill(text: s.background ? "Работает в фоне" : "Занят", color: MH.yellow, pulse: true)
         } else {
             StatusPill(text: "Свободен", color: MH.green)
         }

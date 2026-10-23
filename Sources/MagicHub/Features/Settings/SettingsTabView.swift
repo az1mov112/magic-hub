@@ -90,6 +90,7 @@ struct SettingsTabView: View {
             }
             .padding(.trailing, 6)
         }
+        .rememberScroll("settings")
         .panelMeta("Magic Hub \(version)")
     }
 

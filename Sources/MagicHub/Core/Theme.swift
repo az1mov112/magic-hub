@@ -377,3 +377,36 @@ struct PanelMetaKey: PreferenceKey {
 extension View {
     func panelMeta(_ text: String) -> some View { preference(key: PanelMetaKey.self, value: text) }
 }
+
+// MARK: - Память прокрутки
+
+/// Панель пересоздаётся при каждом открытии; здесь хранится, где остановилась прокрутка.
+private enum ScrollMemory {
+    static var offsets: [String: CGFloat] = [:]
+}
+
+private struct RememberScroll: ViewModifier {
+    let key: String
+    @State private var position = ScrollPosition(edge: .top)
+    @State private var restored = false
+
+    func body(content: Content) -> some View {
+        content
+            .scrollPosition($position)
+            .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.y } action: { _, y in
+                if restored { ScrollMemory.offsets[key] = y }
+            }
+            .onAppear {
+                let y = ScrollMemory.offsets[key] ?? 0
+                DispatchQueue.main.async {
+                    if y > 0 { position.scrollTo(y: y) }
+                    restored = true
+                }
+            }
+    }
+}
+
+extension View {
+    /// Прокрутка остаётся на том же месте после закрытия и открытия панели.
+    func rememberScroll(_ key: String) -> some View { modifier(RememberScroll(key: key)) }
+}

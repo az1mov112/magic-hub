@@ -195,9 +195,20 @@ struct CalendarTabView: View {
     @ViewBuilder private var taskList: some View {
         let items = notion.tasks(in: folder)
         if items.isEmpty {
-            EmptyStateView(systemImage: "checkmark.circle",
-                           title: notion.isLoading && notion.tasks.isEmpty ? "Загружаю задачи…" : "В этой папке задач нет",
-                           subtitle: folder == "today" ? "На сегодня всё сделано" : "")
+            // Папка пуста, но невыполненные задачи есть в других — подсказать, где они.
+            let elsewhere = folder == "all" ? 0 : notion.count(in: "all")
+            VStack(spacing: 10) {
+                EmptyStateView(systemImage: "checkmark.circle",
+                               title: notion.isLoading && notion.tasks.isEmpty ? "Загружаю задачи…" : "В этой папке задач нет",
+                               subtitle: elsewhere > 0 ? "Невыполненных задач в других папках: \(elsewhere)"
+                                                       : (folder == "today" ? "На сегодня всё сделано" : ""))
+                if elsewhere > 0 {
+                    Button("Показать все") { folder = "all" }
+                        .buttonStyle(MHButtonStyle())
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             ScrollView {
                 VStack(spacing: 4) {
