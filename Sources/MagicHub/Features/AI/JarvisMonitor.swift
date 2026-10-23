@@ -62,6 +62,8 @@ final class JarvisMonitor: ObservableObject {
     private var notifiedDown = false
     private var cachedLabel: (label: String, plist: String)?
     private var parseCache: (url: URL, size: UInt64, mtime: Date, result: SessionParse)?
+    /// Файл сессии → есть ли в нём сообщения из Telegram (ключ — путь и время изменения).
+    private var channelCache: [String: (mtime: Date, hasChannel: Bool)] = [:]
 
     func start() {
         schedule()
@@ -165,12 +167,15 @@ final class JarvisMonitor: ObservableObject {
         s.found = s.running || s.serviceLabel != nil || s.botDir != nil
         guard s.found else { return s }
 
-        if let dir = s.botDir, let file = Self.latestSessionFile(forProject: dir) {
+        var background: [(String, Date)] = []
+        let processStart = s.uptime.map { Date().addingTimeInterval(-$0) }
+        if let dir = s.botDir, let file = mainSessionFile(forProject: dir, processStart: processStart) {
             s.sessionFile = file
             let parse = parseSession(file)
             s.busy = parse.busy
             s.lastActivity = parse.lastActivity
-            if let bg = Self.lastBackgroundWrite(forProject: dir, session: file), Date().timeIntervalSince(bg) < 90 {
+            background = Self.backgroundWrites(forProject: dir, main: file)
+            if let bg = background.first?.1, Date().timeIntervalSince(bg) < 90 {
                 s.background = !parse.busy
                 s.busy = true
                 if bg > (s.lastActivity ?? .distantPast) { s.lastActivity = bg }
@@ -515,34 +520,172 @@ final class JarvisMonitor: ObservableObject {
         return AppPaths.home.appendingPathComponent(".claude/projects").appendingPathComponent(encoded)
     }
 
-    static func latestSessionFile(forProject path: String) -> URL? {
+    static func mtime(_ url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+
+    /// Файлы сессий в папке проекта, свежие первыми (без журналов фоновых агентов).
+    static func sessionFiles(forProject path: String) -> [(url: URL, mtime: Date)] {
         let dir = projectDir(for: path)
         let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-        return files.filter { $0.pathExtension == "jsonl" && !$0.lastPathComponent.hasPrefix("agent-") }.max { a, b in
-            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return da < db
+        return files
+            .filter { $0.pathExtension == "jsonl" && !$0.lastPathComponent.hasPrefix("agent-") }
+            .compactMap { url -> (url: URL, mtime: Date)? in
+                guard let d = Self.mtime(url) else { return nil }
+                return (url: url, mtime: d)
+            }
+            .sorted { $0.mtime > $1.mtime }
+    }
+
+    /// Основная сессия — та, куда приходят сообщения из Telegram. Скрипты бота
+    /// (напоминания, утренние сводки) запускают в той же папке свои короткие сессии,
+    /// и самый свежий файл может оказаться одной из них.
+    private func mainSessionFile(forProject path: String, processStart: Date?) -> URL? {
+        let files = Self.sessionFiles(forProject: path)
+        // Свежий запуск без --continue: файл новой сессии появляется сразу после старта процесса.
+        if let start = processStart {
+            let window = start.addingTimeInterval(-5)...start.addingTimeInterval(180)
+            if let f = files.prefix(8).first(where: { f in
+                (try? f.url.resourceValues(forKeys: [.creationDateKey]).creationDate).map { window.contains($0) } ?? false
+            }) {
+                return f.url
+            }
+        }
+        for f in files.prefix(8) {
+            let key = f.url.path
+            let has: Bool
+            if let c = channelCache[key], c.mtime == f.mtime {
+                has = c.hasChannel
+            } else {
+                has = Self.tail(of: f.url, bytes: 2 * 1024 * 1024)?.contains("<channel") ?? false
+                channelCache[key] = (f.mtime, has)
+            }
+            if has { return f.url }
+        }
+        if channelCache.count > 64 { channelCache.removeAll() }
+        return files.first?.url
+    }
+
+    /// Свежие записи вне основной сессии: фоновые агенты (`<сессия>/subagents/*.jsonl`,
+    /// в старых версиях `agent-*.jsonl`), сессии скриптов бота, вывод фоновых команд
+    /// (`<tmp>/claude-<uid>/<проект>/…`). Свежие первыми.
+    static func backgroundWrites(forProject path: String, main: URL) -> [(String, Date)] {
+        let dir = projectDir(for: path)
+        let fm = FileManager.default
+        let recent = Date().addingTimeInterval(-24 * 3600)
+        var found: [(String, Date)] = []
+
+        for f in sessionFiles(forProject: path) where f.url != main && f.mtime > recent {
+            found.append((f.url.lastPathComponent, f.mtime))
+        }
+        let top = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey])) ?? []
+        for url in top {
+            let name = url.lastPathComponent
+            if name.hasPrefix("agent-"), url.pathExtension == "jsonl", let d = mtime(url), d > recent {
+                found.append((name, d))
+            }
+            // Папки сессий с журналами фоновых агентов — только у недавно изменённых.
+            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+                  let d = mtime(url), d > recent || fm.fileExists(atPath: dir.appendingPathComponent(name + ".jsonl").path) else { continue }
+            if let e = fm.enumerator(at: url, includingPropertiesForKeys: [.contentModificationDateKey]) {
+                for case let f as URL in e where f.pathExtension == "jsonl" {
+                    if let fd = mtime(f), fd > recent { found.append((name + "/" + f.lastPathComponent, fd)) }
+                }
+            }
+        }
+        // Вывод фоновых команд Claude Code.
+        let roots = Set([NSTemporaryDirectory(), "/tmp", "/private/tmp"].map {
+            URL(fileURLWithPath: $0).appendingPathComponent("claude-\(getuid())").appendingPathComponent(dir.lastPathComponent)
+                .resolvingSymlinksInPath().path
+        })
+        for root in roots {
+            guard let e = fm.enumerator(at: URL(fileURLWithPath: root), includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey]) else { continue }
+            var seen = 0
+            for case let f as URL in e {
+                seen += 1
+                if seen > 3000 { break }
+                guard (try? f.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
+                      let fd = mtime(f), fd > recent else { continue }
+                found.append(("tmp/" + f.lastPathComponent, fd))
+            }
+        }
+        return found.sorted { $0.1 > $1.1 }
+    }
+
+    // MARK: - Диагностика
+
+    /// Технический отчёт без текста переписки: какие файлы видит монитор и почему решил «занят» или «свободен».
+    /// Вызывать не из очереди монитора.
+    func diagnostics() -> String {
+        queue.sync { diagnosticsText() }
+    }
+
+    private func diagnosticsText() -> String {
+        let s = collect()
+        var l = ["[Джарвис]"]
+        l.append("процесс: " + (s.pid.map { "есть, работает \(Fmt.duration(s.uptime ?? 0))" } ?? "не найден"))
+        l.append("служба launchd: " + (s.serviceLabel == nil ? "не найдена" : "есть, \(s.serviceState ?? "?")"))
+        l.append("Telegram-поллеров: \(s.pollers)")
+        l.append("папка бота: " + Self.mask(s.botDir ?? "—"))
+        if let dir = s.botDir {
+            let pdir = Self.projectDir(for: dir)
+            l.append("папка сессий: \(Self.mask(pdir.path)) — \(FileManager.default.fileExists(atPath: pdir.path) ? "есть" : "НЕТ")")
+            let files = Self.sessionFiles(forProject: dir)
+            l.append("файлов сессий: \(files.count) (→ — основная)")
+            for f in files.prefix(6) {
+                let created = (try? f.url.resourceValues(forKeys: [.creationDateKey]).creationDate).map(Self.agoShort) ?? "?"
+                let telegram = channelCache[f.url.path].map { $0.hasChannel ? "да" : "нет" } ?? "?"
+                l.append("  \(f.url == s.sessionFile ? "→" : " ") \(f.url.lastPathComponent): изменён \(Self.agoShort(f.mtime)), создан \(created), сообщения Telegram: \(telegram)")
+            }
+            if let file = s.sessionFile {
+                l.append("последние записи основной сессии (только типы):")
+                l += Self.recordSummary(file).map { "  " + $0 }
+            }
+            let bg = Self.backgroundWrites(forProject: dir, main: s.sessionFile ?? pdir)
+            l.append("другая активность за сутки: \(bg.count)")
+            for b in bg.prefix(8) { l.append("  \(b.0): \(Self.agoShort(b.1))") }
+        }
+        l.append("итог: занят=\(s.busy ? "да" : "нет"), в фоне=\(s.background ? "да" : "нет"), завис=\(s.hung ? "да" : "нет"), задача=\(s.currentTask == nil ? "нет" : "есть")")
+        return l.joined(separator: "\n")
+    }
+
+    /// Последние записи журнала — только типы записей и имена инструментов, без текста.
+    static func recordSummary(_ url: URL) -> [String] {
+        guard let text = tail(of: url, bytes: 512 * 1024) else { return ["(не читается)"] }
+        return text.split(separator: "\n").suffix(25).compactMap { line in
+            guard let data = line.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            var parts: [String] = []
+            if let ts = (o["timestamp"] as? String).flatMap(Self.parseDate) { parts.append(Self.agoShort(ts)) }
+            let type = o["type"] as? String ?? "?"
+            parts.append((o["subtype"] as? String).map { "\(type)/\($0)" } ?? type)
+            let content = (o["message"] as? [String: Any])?["content"]
+            if let blocks = content as? [[String: Any]] {
+                for b in blocks.prefix(3) {
+                    let bt = b["type"] as? String ?? "?"
+                    parts.append(bt == "tool_use" ? "tool_use:\(b["name"] as? String ?? "?")" : bt)
+                }
+            } else if let str = content as? String {
+                parts.append(str.contains("<channel") ? "сообщение из Telegram" : "текст")
+            }
+            if (o["isSidechain"] as? Bool) == true { parts.append("sidechain") }
+            if (o["isApiErrorMessage"] as? Bool) == true || o["error"] != nil { parts.append("ошибка") }
+            return parts.joined(separator: " ")
         }
     }
 
-    /// Фоновые агенты пишут журналы отдельно: `<сессия>/subagents/*.jsonl`
-    /// (в старых версиях Claude Code — `agent-*.jsonl` рядом с сессией). Время последней записи.
-    static func lastBackgroundWrite(forProject path: String, session: URL) -> Date? {
-        let dir = projectDir(for: path)
-        let fm = FileManager.default
-        var latest: Date?
-        func consider(_ url: URL) {
-            guard url.pathExtension == "jsonl",
-                  let d = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else { return }
-            if d > (latest ?? .distantPast) { latest = d }
-        }
-        let sessionDir = dir.appendingPathComponent(session.deletingPathExtension().lastPathComponent)
-        if let e = fm.enumerator(at: sessionDir, includingPropertiesForKeys: [.contentModificationDateKey]) {
-            for case let url as URL in e { consider(url) }
-        }
-        let top = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-        for url in top where url.lastPathComponent.hasPrefix("agent-") { consider(url) }
-        return latest
+    static func agoShort(_ d: Date) -> String {
+        let s = Int(Date().timeIntervalSince(d))
+        if s < 120 { return "\(s) с назад" }
+        if s < 7200 { return "\(s / 60) мин назад" }
+        return "\(s / 3600) ч назад"
+    }
+
+    /// Домашняя папка — как «~», в том числе в закодированных именах папок Claude Code.
+    static func mask(_ path: String) -> String {
+        let home = AppPaths.home.path
+        let encodedHome = String(home.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+        return path.replacingOccurrences(of: home, with: "~").replacingOccurrences(of: encodedHome, with: "~")
     }
 
     static func tail(of url: URL, bytes: Int) -> String? {

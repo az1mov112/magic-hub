@@ -82,6 +82,10 @@ struct SettingsTabView: View {
                                       buttonTitle: "Открыть") {
                         if let url = URL(string: "https://github.com/az1mov112/magic-hub/releases") { NSWorkspace.shared.open(url) }
                     }
+                    SettingsButtonRow("Диагностика", subtitle: "Технический отчёт, если что-то работает не так. Без текста переписки и токенов",
+                                      buttonTitle: "Скопировать") {
+                        Diagnostics.copy()
+                    }
                     SettingsButtonRow("Выйти из Magic Hub", buttonTitle: "Выйти", destructive: true) {
                         NSApp.terminate(nil)
                     }

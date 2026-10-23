@@ -36,11 +36,13 @@ struct NotionSchema {
 enum NotionError: LocalizedError {
     case notConfigured
     case message(String)
+    case http(Int, String)
 
     var errorDescription: String? {
         switch self {
         case .notConfigured: return "Notion не настроен"
         case .message(let m): return m
+        case .http(_, let m): return m
         }
     }
 }
@@ -59,6 +61,8 @@ final class NotionService: ObservableObject {
     @Published private(set) var locallyDone: Set<String> = []
 
     private var previousStatus: [String: String] = [:]
+    /// Ссылка ведёт не на базу (например, на страницу «штаба») — один раз за запуск ищем базу задач сами.
+    private var autoDiscoveryTried = false
 
     var token: String? {
         guard let t = Keychain.get(NotionService.tokenAccount)?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
@@ -106,8 +110,28 @@ final class NotionService: ObservableObject {
                     self.error = message
                     self.isLoading = false
                 }
+                if case NotionError.http(let code, _) = error, [400, 403, 404].contains(code), !self.autoDiscoveryTried {
+                    self.autoDiscoveryTried = true
+                    _ = await self.testConnection()
+                }
             }
         }
+    }
+
+    /// Технический отчёт для диагностики — без токена и содержимого задач.
+    func diagnostics() -> String {
+        var l = ["[Notion]"]
+        l.append("источник календаря: " + (Prefs.shared.calendarSource == .notion ? "Notion" : "Календарь Mac"))
+        l.append("токен: " + (token == nil ? "нет" : "есть"))
+        l.append("ссылка на базу: " + (databaseID == nil ? "нет" : "есть"))
+        l.append("подключение через новый API: " + (NotionService.dataSourceID == nil ? "нет" : "да"))
+        l.append("загружено задач: \(tasks.count), невыполненных: \(tasks.filter { !isClosed($0) }.count)")
+        l.append("обновлено: " + (lastUpdate.map { Fmt.ago($0) } ?? "ни разу"))
+        l.append("ошибка: " + (error ?? "нет"))
+        if let sc = schema {
+            l.append("поля: название=\(sc.titleProp ?? "—"), срок=\(sc.dateProp ?? "—"), статус=\(sc.statusProp ?? "—"), сфера=\(sc.sphereProp ?? "—"), проект=\(sc.projectProp ?? "—")")
+        }
+        return l.joined(separator: "\n")
     }
 
     /// Проверка подключения для настроек: (успех, текст).
@@ -528,7 +552,7 @@ final class NotionService: ObservableObject {
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
             let message = (json["message"] as? String) ?? "HTTP \(code)"
-            throw NotionError.message(NotionService.humanize(code: code, message: message))
+            throw NotionError.http(code, NotionService.humanize(code: code, message: message))
         }
         return json
     }

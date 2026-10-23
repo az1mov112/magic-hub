@@ -185,6 +185,7 @@ private struct AIJarvisCard: View {
             Spacer(minLength: 0)
             MHIconButton("network", help: "Проверить сеть", size: 26) { jarvis.checkNetwork() }
             MHIconButton("doc.text", help: "Открыть лог", size: 26) { jarvis.openLog() }
+            MHIconButton("stethoscope", help: "Скопировать диагностику (без текста переписки)", size: 26) { Diagnostics.copy() }
         }
     }
 }
