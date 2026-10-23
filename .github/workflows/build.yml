@@ -1,0 +1,81 @@
+name: Build
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+    paths-ignore: ["docs/**", "**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)" || true
+          xcodebuild -version
+          swift --version
+
+      - name: Постоянный сертификат подписи
+        env:
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_CERT_PASSWORD" ]; then
+            echo "::warning::Секрет MACOS_CERT_PASSWORD не задан — подпись ad-hoc, разрешения macOS будут сбрасываться после каждого обновления"
+            exit 0
+          fi
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p ci "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p ci "$KC"
+          security import certs/magichub-signing.p12 -k "$KC" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain certs/magichub-signing.cer.pem
+          HASH=$(security find-identity -p codesigning "$KC" | awk '/Magic Hub Self-Signed/ {print $2; exit}')
+          echo "Сертификат: $HASH"
+          [ -n "$HASH" ] && echo "SIGN_IDENTITY=$HASH" >> "$GITHUB_ENV"
+
+      - name: Сборка Magic Hub.app
+        env:
+          VERSION: 0.1.${{ github.run_number }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          # Без гигантских строк команд компилятора — только понятные ошибки.
+          set -o pipefail
+          ./scripts/bundle.sh 2>&1 | awk 'length($0) < 1500'
+
+      - name: Артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: MagicHub
+          path: build/MagicHub.zip
+          retention-days: 14
+
+      - name: Свежая сборка в Releases (nightly)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Magic Hub — свежая сборка (0.1.${{ github.run_number }})"
+          NOTES="Автосборка из ветки ${GITHUB_REF_NAME}, коммит ${GITHUB_SHA::7}. Как установить — docs/INSTALL.md.
+
+          build: ${{ github.run_number }}"
+          # Тег переносим на текущий коммит, релиз обновляем на месте — без момента, когда его нет.
+          git tag -f nightly "${GITHUB_SHA}"
+          git push -f origin refs/tags/nightly
+          if gh release view nightly > /dev/null 2>&1; then
+            gh release upload nightly build/MagicHub.zip --clobber
+            gh release edit nightly --title "$TITLE" --notes "$NOTES" --prerelease
+          else
+            gh release create nightly build/MagicHub.zip --prerelease --title "$TITLE" --notes "$NOTES"
+          fi
