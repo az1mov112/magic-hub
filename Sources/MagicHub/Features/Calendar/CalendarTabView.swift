@@ -6,6 +6,8 @@ struct CalendarTabView: View {
     @ObservedObject private var notion = NotionService.shared
     @ObservedObject private var mac = CalendarEventsModel.shared
     @AppStorage("calendar.folder") private var folder = "today"
+    @State private var checkResult: String?
+    @State private var checking = false
 
     private let timer = Timer.publish(every: 300, on: .main, in: .common).autoconnect()
 
@@ -194,7 +196,33 @@ struct CalendarTabView: View {
 
     @ViewBuilder private var taskList: some View {
         let items = notion.tasks(in: folder)
-        if items.isEmpty {
+        if notion.tasks.isEmpty && !notion.isLoading && notion.lastUpdate != nil {
+            // Notion ответил, но задач нет — показать, куда именно подключены, а не просто пустоту.
+            VStack(spacing: 10) {
+                EmptyStateView(systemImage: "tray",
+                               title: "Notion вернул 0 задач",
+                               subtitle: "Подключена база «\(notion.sourceTitle ?? "без названия")». Если задачи Джарвиса лежат в другой — нажмите «Проверить подключение» или вставьте ссылку на базу «Задачи» в настройках")
+                HStack(spacing: 8) {
+                    Button(checking ? "Проверяю…" : "Проверить подключение") {
+                        checking = true
+                        Task { @MainActor in
+                            let r = await notion.testConnection()
+                            checkResult = r.1
+                            checking = false
+                        }
+                    }
+                    .buttonStyle(MHButtonStyle(kind: .prominent))
+                    .disabled(checking)
+                    Button("Диагностика") { Diagnostics.copy() }
+                        .buttonStyle(MHButtonStyle())
+                }
+                if let checkResult {
+                    Text(checkResult).font(.system(size: 11)).foregroundStyle(MH.t2).multilineTextAlignment(.center)
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if items.isEmpty {
             // Папка пуста, но невыполненные задачи есть в других — подсказать, где они.
             let elsewhere = folder == "all" ? 0 : notion.count(in: "all")
             VStack(spacing: 10) {

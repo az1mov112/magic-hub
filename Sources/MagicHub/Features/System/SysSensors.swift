@@ -246,7 +246,10 @@ struct SysBattery: Equatable {
     var timeRemaining: TimeInterval?
     var temperature: Double?
     var cycles: Int?
+    /// Максимальная ёмкость — как в «Системных настройках → Аккумулятор».
     var health: Double?
+    /// Сколько батарея вмещает прямо сейчас относительно новой (сырое значение, плавает с температурой).
+    var rawHealth: Double?
     /// Потребление всей системы, Вт.
     var systemWatts: Double?
     /// + заряжается, − отдаёт, Вт.
@@ -304,15 +307,19 @@ enum SysPower {
             b.temperature = t.doubleValue / 100
         }
         b.cycles = (d["CycleCount"] as? NSNumber)?.intValue
+        // Как считает macOS: готовый процент (Apple Silicon), иначе номинальная ёмкость к проектной.
+        // Сырая AppleRawMaxCapacity ниже и плавает — её показываем отдельно.
         let design = (d["DesignCapacity"] as? NSNumber)?.doubleValue ?? 0
-        if let raw = (d["AppleRawMaxCapacity"] as? NSNumber)?.doubleValue, design > 0, raw > 0 {
-            b.health = min(100, raw / design * 100)
-        } else if let maxCap = (d["MaxCapacity"] as? NSNumber)?.doubleValue {
-            if maxCap > 100, design > 0 {
-                b.health = min(100, maxCap / design * 100)
-            } else if maxCap > 0 {
-                b.health = maxCap
-            }
+        let raw = (d["AppleRawMaxCapacity"] as? NSNumber)?.doubleValue ?? 0
+        if design > 0, raw > 0 { b.rawHealth = min(100, raw / design * 100) }
+        if let pct = ((d["BatteryData"] as? [String: Any])?["MaximumCapacityPercent"] as? NSNumber)?.doubleValue, pct > 0 {
+            b.health = min(100, pct)
+        } else if let nominal = (d["NominalChargeCapacity"] as? NSNumber)?.doubleValue, nominal > 0, design > 0 {
+            b.health = min(100, nominal / design * 100)
+        } else if let maxCap = (d["MaxCapacity"] as? NSNumber)?.doubleValue, maxCap > 0 {
+            b.health = maxCap > 100 && design > 0 ? min(100, maxCap / design * 100) : min(100, maxCap)
+        } else {
+            b.health = b.rawHealth
         }
         if let v = signed(d["Voltage"]), let a = signed(d["InstantAmperage"] ?? d["Amperage"]) {
             b.batteryWatts = Double(v) * Double(a) / 1_000_000

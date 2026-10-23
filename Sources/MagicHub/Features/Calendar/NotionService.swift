@@ -57,6 +57,9 @@ final class NotionService: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var error: String?
     @Published private(set) var lastUpdate: Date?
+    /// Название подключённой базы и сколько строк она вернула — чтобы пустой список объяснял сам себя.
+    @Published private(set) var sourceTitle: String?
+    @Published private(set) var lastPageCount = 0
     /// Задачи, отмеченные выполненными в этой сессии: остаются в списке, чтобы можно было снять галочку.
     @Published private(set) var locallyDone: Set<String> = []
 
@@ -96,7 +99,12 @@ final class NotionService: ObservableObject {
                     cursor = (res["has_more"] as? Bool) == true ? res["next_cursor"] as? String : nil
                 } while cursor != nil && pages.count < 2000
                 let tasks = pages.compactMap { NotionService.parseTask($0, schema: schema) }
+                let title = NotionService.plainTitle(schemaJSON["title"])
+                let sourceTitle = title.isEmpty ? (schemaJSON["name"] as? String) : title
+                let pageCount = pages.count
                 await MainActor.run {
+                    self.sourceTitle = sourceTitle
+                    self.lastPageCount = pageCount
                     self.schema = schema
                     self.tasks = tasks
                     self.locallyDone = []
@@ -125,6 +133,7 @@ final class NotionService: ObservableObject {
         l.append("токен: " + (token == nil ? "нет" : "есть"))
         l.append("ссылка на базу: " + (databaseID == nil ? "нет" : "есть"))
         l.append("подключение через новый API: " + (NotionService.dataSourceID == nil ? "нет" : "да"))
+        l.append("база: " + (sourceTitle.map { "«\($0)»" } ?? "—") + ", строк от Notion: \(lastPageCount)")
         l.append("загружено задач: \(tasks.count), невыполненных: \(tasks.filter { !isClosed($0) }.count)")
         l.append("обновлено: " + (lastUpdate.map { Fmt.ago($0) } ?? "ни разу"))
         l.append("ошибка: " + (error ?? "нет"))

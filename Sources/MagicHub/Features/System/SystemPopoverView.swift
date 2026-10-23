@@ -331,6 +331,10 @@ private struct SysPowerTab: View {
                     SysKV(key: "Осталось (оценка системы)", value: b.timeRemaining.map { Fmt.duration($0) } ?? (b.onAC ? "—" : "считается…"))
                     SysKV(key: "Состояние батареи",
                           value: [b.health.map { "\(Int($0.rounded()))%" }, b.cycles.map { "\($0) циклов" }].compactMap { $0 }.joined(separator: " · "))
+                    if let raw = b.rawHealth, let h = b.health, abs(raw - h) >= 2 {
+                        SysKV(key: "Вмещает сейчас", value: "\(Int(raw.rounded()))%")
+                            .help("Сырая ёмкость от контроллера батареи: плавает с температурой и калибровкой. В «Системных настройках» — значение «Состояние батареи»")
+                    }
                 }
                 SysCard {
                     Button { showApps.toggle() } label: {
