@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotchManager.shared.start()
         logo = LogoStatusItem()
         StatusBarController.shared.start()
+        WindowLayoutManager.shared.start()
         AwakeController.shared.start()
         NowPlayingModel.shared.start()
         ClipboardWatcher.shared.start()

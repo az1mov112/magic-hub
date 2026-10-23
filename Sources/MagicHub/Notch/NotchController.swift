@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import Combine
 
-enum NotchMode: Equatable { case idle, live, hud, notif, open }
+enum NotchMode: Equatable { case idle, live, hud, notif, open, layout }
 
 /// Размеры чёлки для конкретного экрана.
 /// wide — своя чёлка на Mac без выреза (как в Cyclop), cutout — под настоящий вырез.
@@ -59,6 +59,30 @@ struct NotchGeometry: Equatable {
             : CGSize(width: 270, height: max(menuBarHeight, 24) + 6)
     }
 
+    // Полоса шаблонов раскладки окон: плитки фиксированного размера, чтобы попадание курсора
+    // считалось по тем же числам, по которым они нарисованы.
+    static let layoutTile = CGSize(width: 46, height: 30)
+    static let layoutGap: CGFloat = 8
+    static let layoutPadding: CGFloat = 16
+    var layoutTopInset: CGFloat { (isCutout ? notchSize.height : max(menuBarHeight, 24)) + 8 }
+    var layoutSize: CGSize {
+        let n = CGFloat(WindowLayout.strip.count)
+        let w = Self.layoutPadding * 2 + n * Self.layoutTile.width + (n - 1) * Self.layoutGap
+        return CGSize(width: w, height: layoutTopInset + Self.layoutTile.height + 6 + 14 + 12)
+    }
+
+    /// Номер шаблона под курсором (координаты экрана) — по горизонтали, с допуском по высоте.
+    func layoutIndex(at p: NSPoint) -> Int? {
+        let size = layoutSize
+        let left = screenFrame.midX - size.width / 2 + Self.layoutPadding
+        guard p.y >= screenFrame.maxY - size.height - 60 else { return nil }
+        let step = Self.layoutTile.width + Self.layoutGap
+        let x = p.x - left + Self.layoutGap / 2
+        guard x >= 0 else { return nil }
+        let i = Int(x / step)
+        return i < WindowLayout.strip.count ? i : nil
+    }
+
     var headerTop: CGFloat { isCutout ? notchSize.height + 8 : 9 }
     var contentTop: CGFloat { isCutout ? notchSize.height + 36 : 38 }
 
@@ -69,12 +93,14 @@ struct NotchGeometry: Equatable {
         case .hud: return hudSize
         case .notif: return notifSize
         case .open: return openSize
+        case .layout: return layoutSize
         }
     }
 
     func cornerRadius(for mode: NotchMode) -> CGFloat {
         switch mode {
         case .open: return 26
+        case .layout: return 22
         case .notif: return 24
         case .live: return isCutout ? 12 : 14
         case .hud: return isCutout ? 14 : 18
@@ -92,11 +118,15 @@ struct NotchGeometry: Equatable {
 final class NotchModel: ObservableObject {
     @Published var isOpen = false
     @Published var geometry: NotchGeometry
+    /// Тащат окно к чёлке — показать шаблоны раскладки.
+    @Published var layoutActive = false
+    @Published var layoutHover: WindowLayout?
 
     init(geometry: NotchGeometry) { self.geometry = geometry }
 
     var mode: NotchMode {
         if isOpen { return .open }
+        if layoutActive { return .layout }
         if HUDModel.shared.current != nil { return .hud }
         if AppModel.shared.notification != nil { return .notif }
         if Prefs.shared.liveIndicators && (NowPlayingModel.shared.isPlaying || AwakeController.shared.isActive || JarvisMonitor.shared.isBusy) {
@@ -176,16 +206,22 @@ final class NotchController {
     }
 
     func handleMove(_ p: NSPoint) {
+        if model.layoutActive {
+            panel.ignoresMouseEvents = true
+            cancelOpen()
+            return
+        }
         let inside = activeRect.contains(p)
         if panel.ignoresMouseEvents == inside { panel.ignoresMouseEvents = !inside }
         let prefs = Prefs.shared
+        let app = AppModel.shared
         if model.isOpen {
-            if inside || prefs.openMode == .click || AppModel.shared.pinnedOpen || Date() < AppModel.shared.holdOpenUntil {
+            if inside || prefs.openMode == .click || app.pinnedOpen || app.fileDragActive || Date() < app.holdOpenUntil {
                 cancelClose()
             } else {
                 scheduleClose()
             }
-        } else if prefs.openMode == .hover && inside {
+        } else if prefs.openMode == .hover && inside && !WindowLayoutManager.shared.windowDragging {
             scheduleOpen()
         } else {
             cancelOpen()
@@ -323,12 +359,21 @@ final class NotchManager {
             self?.mouseMoved()
             return e
         }) { monitors.append(m) }
-        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] _ in
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] e in
             let p = NSEvent.mouseLocation
+            if e.type == .leftMouseDown { self?.mouseDownForDrag() }
             self?.controllers.forEach { $0.handleOutsideClick(p) }
+        }) { monitors.append(m) }
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp], handler: { [weak self] _ in
+            self?.endFileDrag()
+        }) { monitors.append(m) }
+        if let m = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp], handler: { [weak self] e in
+            self?.endFileDrag()
+            return e
         }) { monitors.append(m) }
         if let m = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown], handler: { [weak self] e in
             guard let self else { return e }
+            self.mouseDownForDrag()
             let p = NSEvent.mouseLocation
             for c in self.controllers where e.window === c.panel {
                 if c.handleLocalClick(p) { return nil }
@@ -363,7 +408,51 @@ final class NotchManager {
     private func mouseMoved() {
         let p = NSEvent.mouseLocation
         lastPoint = p
+        if NSEvent.pressedMouseButtons & 1 != 0 { checkFileDrag(p) }
         controllers.forEach { $0.handleMove(p) }
+    }
+
+    // MARK: Файл тащат к чёлке → открыть полку
+
+    /// Перетаскивание файла видно по «drag»-буферу: его счётчик меняется, когда начинается перетаскивание.
+    private var dragChangeAtDown = NSPasteboard(name: .drag).changeCount
+    private var fileDragging = false
+
+    private func mouseDownForDrag() {
+        dragChangeAtDown = NSPasteboard(name: .drag).changeCount
+        fileDragging = false
+    }
+
+    private func checkFileDrag(_ p: NSPoint) {
+        let prefs = Prefs.shared
+        guard prefs.shelfDragOpen, prefs.isVisible(.shelf), !WindowLayoutManager.shared.windowDragging,
+              let c = controllers.first(where: { $0.screen.frame.contains(p) }) else { return }
+        let f = c.screen.frame
+        // Курсор у верхнего края, рядом с чёлкой.
+        guard p.y >= f.maxY - 60, abs(p.x - f.midX) <= 280 else { return }
+        if !fileDragging {
+            let pb = NSPasteboard(name: .drag)
+            guard pb.changeCount != dragChangeAtDown, let types = pb.types,
+                  types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType")) else { return }
+            fileDragging = true
+        }
+        let app = AppModel.shared
+        if !app.fileDragActive {
+            app.fileDragActive = true
+            app.tab = .shelf
+            c.open()
+        }
+    }
+
+    private func endFileDrag() {
+        guard fileDragging || AppModel.shared.fileDragActive else { return }
+        fileDragging = false
+        // Дать полке принять файл, затем вернуть обычное поведение: увели курсор — панель свернётся.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            AppModel.shared.fileDragActive = false
+            let p = NSEvent.mouseLocation
+            self?.controllers.forEach { $0.handleMove(p) }
+        }
     }
 
     func rebuild() {

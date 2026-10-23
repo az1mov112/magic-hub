@@ -70,6 +70,7 @@ struct SettingsTabView: View {
                 }
 
                 HUDSettingsSection()
+                WindowsSettingsSection()
                 MenuBarSettingsSection()
                 NotificationsSettingsSection()
                 ClipboardSettingsSection()

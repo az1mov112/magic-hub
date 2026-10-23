@@ -19,6 +19,13 @@ final class Prefs: ObservableObject {
 
     @Published var autoUpdateCheck: Bool = Prefs.bool("autoUpdateCheck", true) { didSet { Prefs.d.set(autoUpdateCheck, forKey: "autoUpdateCheck") } }
 
+    /// Файл, который тащат к чёлке, открывает полку.
+    @Published var shelfDragOpen: Bool = Prefs.bool("shelfDragOpen", true) { didSet { Prefs.d.set(shelfDragOpen, forKey: "shelfDragOpen") } }
+    /// Окно, которое тащат к чёлке, показывает шаблоны раскладки.
+    @Published var windowLayout: Bool = Prefs.bool("windowLayout", true) { didSet { Prefs.d.set(windowLayout, forKey: "windowLayout") } }
+    /// Горячие клавиши раскладки окон (⌃⌥ + клавиша).
+    @Published var layoutHotkeys: Bool = Prefs.bool("layoutHotkeys", true) { didSet { Prefs.d.set(layoutHotkeys, forKey: "layoutHotkeys") } }
+
     /// Экономный режим: реже опросы, без анимаций в свёрнутой чёлке. «Авто» — на Intel и в режиме энергосбережения.
     @Published var perfMode: PerfMode = Prefs.enumValue("perfMode", PerfMode.auto) {
         didSet {

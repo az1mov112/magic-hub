@@ -128,35 +128,70 @@ private struct ClipRow: View {
 struct ShelfTabView: View {
     @ObservedObject private var store = ShelfStore.shared
     @State private var dropTarget = false
+    @State private var selected: Set<String> = []
+    @FocusState private var focused: Bool
 
     private let columns = [GridItem(.adaptive(minimum: 128), spacing: 10)]
+
+    private var selectedItems: [ShelfItem] { store.items.filter { selected.contains($0.id) } }
+    private var selectedURLs: [URL] { selectedItems.filter { !$0.missing }.map(\.url) }
 
     var body: some View {
         VStack(spacing: 8) {
             if store.items.isEmpty {
                 EmptyStateView(systemImage: "tray",
                                title: "Полка пуста",
-                               subtitle: "Сделайте снимок экрана в буфер (⌃⇧⌘4) или перетащите сюда файл")
+                               subtitle: "Перетащите файл к чёлке — он ляжет сюда, а сам останется на месте. Снимки экрана в буфер (⌃⇧⌘4) тоже попадают сюда")
             } else {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 10) {
                         ForEach(store.items) { item in
-                            ShelfCell(item: item)
+                            ShelfCell(item: item, isSelected: selected.contains(item.id)) {
+                                tap(item)
+                            }
                         }
                     }
                 }
             }
             HStack(spacing: 8) {
-                Text("Перетащите снимок в любое приложение · клик — снова в буфер")
+                Text(selected.isEmpty ? "Клик — выбрать, ⌘-клик — несколько, пробел — просмотр, перетащите куда угодно"
+                                      : "Выбрано: \(selected.count)")
                     .font(.system(size: 11))
                     .foregroundStyle(MH.t3)
                     .lineLimit(1)
                 Spacer(minLength: 4)
-                Button("Показать в Finder") { NSWorkspace.shared.open(store.folder) }
-                    .buttonStyle(MHButtonStyle())
-                ClipConfirmButton("Очистить") { store.clear() }
+                Button {
+                    ShelfActions.airDrop(selectedURLs)
+                } label: {
+                    Label("AirDrop", systemImage: "dot.radiowaves.up.forward")
+                }
+                .buttonStyle(MHButtonStyle())
+                .disabled(selectedURLs.isEmpty)
+                ShareLink(items: selectedURLs) {
+                    Label("Поделиться", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(MHButtonStyle())
+                .disabled(selectedURLs.isEmpty)
+                Button(selected.count == store.items.count && !store.items.isEmpty ? "Снять выбор" : "Выбрать всё") {
+                    selected = selected.count == store.items.count ? [] : Set(store.items.map(\.id))
+                }
+                .buttonStyle(MHButtonStyle())
+                .disabled(store.items.isEmpty)
+                ClipConfirmButton(selected.isEmpty ? "Очистить" : "Убрать") {
+                    if selected.isEmpty { store.clear() } else { store.remove(selectedItems) }
+                    selected = []
+                }
             }
         }
+        .focusable()
+        .focusEffectDisabled()
+        .focused($focused)
+        .onKeyPress(.space) {
+            ShelfActions.quickLook(selectedURLs)
+            return .handled
+        }
+        .onAppear { focused = true }
+        .onChange(of: store.items) { selected = selected.intersection(Set(store.items.map(\.id))) }
         .overlay {
             if dropTarget {
                 RoundedRectangle(cornerRadius: 12)
@@ -169,6 +204,37 @@ struct ShelfTabView: View {
         }
         .panelMeta(ShelfFormat.countText(store.items.count) + " · " + Fmt.bytes(Double(store.totalSize)))
     }
+
+    private func tap(_ item: ShelfItem) {
+        // Панель чёлки не забирает клавиатуру сама — чтобы работал пробел, делаем её ключевой.
+        NSApp.windows.first { $0 is NotchPanel && $0.frame.contains(NSEvent.mouseLocation) }?.makeKey()
+        focused = true
+        if NSEvent.modifierFlags.contains(.command) {
+            if selected.contains(item.id) { selected.remove(item.id) } else { selected.insert(item.id) }
+        } else {
+            selected = selected == [item.id] ? [] : [item.id]
+        }
+    }
+}
+
+/// Действия с файлами полки.
+enum ShelfActions {
+    static func airDrop(_ urls: [URL]) {
+        guard !urls.isEmpty, let service = NSSharingService(named: .sendViaAirDrop) else { return }
+        NSApp.activate()
+        service.perform(withItems: urls)
+    }
+
+    /// Быстрый просмотр (как пробел в Finder).
+    static func quickLook(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/qlmanage")
+        p.arguments = ["-p"] + urls.map(\.path)
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+    }
 }
 
 enum ShelfDrop {
@@ -178,7 +244,7 @@ enum ShelfDrop {
             if p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
                 handled = true
                 _ = p.loadObject(ofClass: URL.self) { url, _ in
-                    if let url { ShelfStore.shared.addFile(url) }
+                    if let url { ShelfStore.shared.addReference(url) }
                 }
             } else if p.canLoadObject(ofClass: NSImage.self) {
                 handled = true
@@ -187,12 +253,15 @@ enum ShelfDrop {
                 }
             }
         }
+        if handled { DispatchQueue.main.async { AppModel.shared.flash("На полке") } }
         return handled
     }
 }
 
 private struct ShelfCell: View {
     let item: ShelfItem
+    let isSelected: Bool
+    let onTap: () -> Void
     @State private var thumb: NSImage?
     @State private var hover = false
 
@@ -203,21 +272,27 @@ private struct ShelfCell: View {
                 .frame(maxWidth: .infinity)
                 .overlay {
                     if let thumb {
-                        Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill)
+                        Image(nsImage: thumb).resizable()
+                            .aspectRatio(contentMode: item.isReference && !isImage ? .fit : .fill)
+                            .padding(item.isReference && !isImage ? 10 : 0)
                     } else {
-                        Image(systemName: "photo").font(.system(size: 18)).foregroundStyle(MH.t3)
+                        Image(systemName: item.isFolder ? "folder" : "doc").font(.system(size: 18)).foregroundStyle(MH.t3)
                     }
                 }
                 .background(RoundedRectangle(cornerRadius: 6).fill(MH.card3))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
+                .saturation(item.missing ? 0 : 1)
             HStack(spacing: 4) {
-                Text(item.title).font(.system(size: 11)).foregroundStyle(MH.t1).lineLimit(1)
+                Text(item.title).font(.system(size: 11)).foregroundStyle(item.missing ? MH.t3 : MH.t1)
+                    .lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 4)
-                Text(Fmt.bytes(Double(item.size))).font(.system(size: 11)).foregroundStyle(MH.t3).lineLimit(1)
+                Text(item.sizeText).font(.system(size: 11)).foregroundStyle(item.missing ? MH.orange : MH.t3).lineLimit(1)
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 12).fill(hover ? MH.card2 : MH.card))
+        .background(RoundedRectangle(cornerRadius: 12).fill(isSelected ? MH.accent.opacity(0.22) : (hover ? MH.card2 : MH.card)))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(isSelected ? MH.accent : Color.clear, lineWidth: 1.5))
+        .opacity(item.missing ? 0.6 : 1)
         .overlay(alignment: .topTrailing) {
             if hover {
                 Button {
@@ -231,27 +306,40 @@ private struct ShelfCell: View {
                 }
                 .buttonStyle(.plain)
                 .padding(5)
-                .help("Удалить с полки")
+                .help(item.isReference ? "Убрать с полки (файл останется на месте)" : "Удалить с полки")
             }
         }
         .contentShape(Rectangle())
         .onHover { hover = $0 }
-        .onTapGesture {
-            Clipboard.copy(fileURL: item.url)
-            AppModel.shared.flash("Скопировано")
+        .onTapGesture(count: 2) {
+            if !item.missing { NSWorkspace.shared.open(item.url) }
         }
+        .onTapGesture(perform: onTap)
         .onDrag {
-            NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
+            item.missing ? NSItemProvider() : (NSItemProvider(contentsOf: item.url) ?? NSItemProvider())
         }
-        .task(id: item.url) {
-            let url = item.url
-            let image: NSImage? = await withCheckedContinuation { cont in
-                DispatchQueue.global(qos: .utility).async {
-                    cont.resume(returning: ShelfThumbCache.shared.thumbnail(for: url))
+        .contextMenu {
+            if !item.missing {
+                Button("Открыть") { NSWorkspace.shared.open(item.url) }
+                Button("Просмотр") { ShelfActions.quickLook([item.url]) }
+                Button("Показать в Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
+                Button("Скопировать") {
+                    Clipboard.copy(fileURL: item.url)
+                    AppModel.shared.flash("Скопировано")
                 }
+                Button("AirDrop") { ShelfActions.airDrop([item.url]) }
+                Divider()
             }
-            thumb = image
+            Button(item.isReference ? "Убрать с полки" : "Удалить") { ShelfStore.shared.remove(item) }
         }
+        .help(item.missing ? "Файл удалён или недоступен" : item.url.path.replacingOccurrences(of: AppPaths.home.path, with: "~"))
+        .task(id: item.id + (item.missing ? "-missing" : "")) {
+            thumb = await ShelfThumbCache.shared.load(for: item)
+        }
+    }
+
+    private var isImage: Bool {
+        ["png", "jpg", "jpeg", "heic", "tiff", "tif", "gif", "webp", "bmp"].contains(item.url.pathExtension.lowercased())
     }
 }
 
