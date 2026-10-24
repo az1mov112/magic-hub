@@ -24,8 +24,10 @@ struct MusicTabView: View {
 
     private var content: some View {
         HStack(alignment: .center, spacing: 24) {
+            // Кадр видео (YouTube, сериалы в браузере) — широкая рамка 16:9, обложка трека — квадрат.
             MusicCover(image: np.artwork)
-                .frame(width: 170, height: 170)
+                .frame(width: isWideArtwork ? 256 : 170, height: isWideArtwork ? 144 : 170)
+                .animation(.easeInOut(duration: 0.25), value: isWideArtwork)
 
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 6) {
@@ -92,6 +94,11 @@ struct MusicTabView: View {
         .animation(.easeInOut(duration: 0.25), value: np.title)
     }
 
+    private var isWideArtwork: Bool {
+        guard let a = np.artwork, a.size.height > 0 else { return false }
+        return a.size.width / a.size.height > 1.25
+    }
+
     private var stateLine: String {
         let state = np.isPlaying ? "Сейчас играет" : "На паузе"
         return np.sourceName.isEmpty ? state : "\(state) · \(np.sourceName)"
@@ -106,25 +113,30 @@ struct MusicTabView: View {
 private struct MusicCover: View {
     let image: NSImage?
 
+    // Размер задаёт подложка, картинка лежит поверх и обрезается по ней:
+    // иначе кадр видео 16:9 растягивал бы рамку и вылезал на соседние элементы.
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 16).fill(Color(hex: "3B2F5C"))
-            if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .id(ObjectIdentifier(image))
-                    .transition(.opacity)
-            } else {
-                Image(systemName: "music.note")
-                    .font(.system(size: 52, weight: .light))
-                    .foregroundStyle(Color.white.opacity(0.85))
-                    .transition(.opacity)
+        RoundedRectangle(cornerRadius: 16)
+            .fill(Color(hex: "3B2F5C"))
+            .overlay {
+                ZStack {
+                    if let image {
+                        Image(nsImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .id(ObjectIdentifier(image))
+                            .transition(.opacity)
+                    } else {
+                        Image(systemName: "music.note")
+                            .font(.system(size: 52, weight: .light))
+                            .foregroundStyle(Color.white.opacity(0.85))
+                            .transition(.opacity)
+                    }
+                }
             }
-        }
-        .animation(.easeInOut(duration: 0.3), value: image.map { ObjectIdentifier($0) })
-        .clipShape(RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(MH.line, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(MH.line, lineWidth: 1))
+            .animation(.easeInOut(duration: 0.3), value: image.map { ObjectIdentifier($0) })
     }
 }
 
