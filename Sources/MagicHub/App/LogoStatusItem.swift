@@ -19,8 +19,10 @@ final class LogoStatusItem: NSObject {
         item.button?.toolTip = "Magic Hub"
         updateImage()
 
-        Prefs.shared.$showMenuBarIcon.receive(on: RunLoop.main)
-            .sink { [weak self] on in self?.item.isVisible = on }
+        // Значок «Не спать» виден в меню-баре, даже если сердечко скрыто в настройках.
+        Publishers.CombineLatest(Prefs.shared.$showMenuBarIcon, AwakeController.shared.$isActive)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] show, awake in self?.item.isVisible = show || awake }
             .store(in: &cancellables)
         Publishers.CombineLatest3(AwakeController.shared.$isActive, Prefs.shared.$awakeIcon, Prefs.shared.$awakeColor)
             .receive(on: RunLoop.main)

@@ -138,7 +138,8 @@ final class NotchModel: ObservableObject {
         if dropActive { return .drop }
         if HUDModel.shared.current != nil { return .hud }
         if AppModel.shared.notification != nil { return .notif }
-        if Prefs.shared.liveIndicators && (NowPlayingModel.shared.isPlaying || AwakeController.shared.isActive || JarvisMonitor.shared.isBusy) {
+        // «Не спать» чёлку не расширяет — его значок в меню-баре (вместо сердечка).
+        if Prefs.shared.liveIndicators && (NowPlayingModel.shared.isPlaying || JarvisMonitor.shared.isBusy) {
             return .live
         }
         return .idle
@@ -358,7 +359,6 @@ final class NotchManager {
         // Перерисовать живые индикаторы, когда меняется то, что они показывают.
         Publishers.MergeMany(
             NowPlayingModel.shared.$isPlaying.map { _ in () }.eraseToAnyPublisher(),
-            AwakeController.shared.$isActive.map { _ in () }.eraseToAnyPublisher(),
             JarvisMonitor.shared.$isBusy.map { _ in () }.eraseToAnyPublisher(),
             HUDModel.shared.$current.map { _ in () }.eraseToAnyPublisher(),
             AppModel.shared.$notification.map { _ in () }.eraseToAnyPublisher()

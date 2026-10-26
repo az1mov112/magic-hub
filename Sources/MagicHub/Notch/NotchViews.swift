@@ -8,7 +8,6 @@ struct NotchRootView: View {
     @ObservedObject private var app = AppModel.shared
     @ObservedObject private var prefs = Prefs.shared
     @ObservedObject private var music = NowPlayingModel.shared
-    @ObservedObject private var awake = AwakeController.shared
     @ObservedObject private var jarvis = JarvisMonitor.shared
     @ObservedObject private var hud = HUDModel.shared
 
@@ -65,10 +64,9 @@ struct NotchRootView: View {
     }
 }
 
-/// Свёрнутая чёлка с «живыми» значками: музыка, Джарвис, «Не спать».
+/// Свёрнутая чёлка с «живыми» значками: музыка и занятость Джарвиса.
 private struct LiveContent: View {
     @ObservedObject private var music = NowPlayingModel.shared
-    @ObservedObject private var awake = AwakeController.shared
     @ObservedObject private var jarvis = JarvisMonitor.shared
 
     var body: some View {
@@ -91,13 +89,8 @@ private struct LiveContent: View {
                 }
             }
             Spacer(minLength: 0)
-            HStack(spacing: 8) {
-                if awake.isActive {
-                    Image(systemName: "moon.zzz.fill").font(.system(size: 10)).foregroundStyle(MH.t2)
-                }
-                if music.isPlaying {
-                    EqualizerBars()
-                }
+            if music.isPlaying {
+                EqualizerBars()
             }
         }
         .padding(.horizontal, 12)

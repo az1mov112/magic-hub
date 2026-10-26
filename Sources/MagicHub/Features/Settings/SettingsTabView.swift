@@ -45,7 +45,7 @@ struct SettingsTabView: View {
                                            AppModel.shared.holdOpen(for: 1.5)
                                            prefs.panelScale = value
                                        }))
-                    SettingsToggleRow("Живые индикаторы в свёрнутой чёлке", subtitle: "Музыка, занятость Джарвиса, «Не спать»",
+                    SettingsToggleRow("Живые индикаторы в свёрнутой чёлке", subtitle: "Музыка и занятость Джарвиса. «Не спать» — значком в меню-баре",
                                       isOn: $prefs.liveIndicators)
                     SettingsToggleRow("Показывать на всех дисплеях", isOn: $prefs.allDisplays)
                 }
