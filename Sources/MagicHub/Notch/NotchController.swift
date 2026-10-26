@@ -52,13 +52,6 @@ struct NotchGeometry: Equatable {
     }
     /// Индикатор громкости/яркости: под вырезом — «крылья» по бокам выреза, иначе — плашка чуть ниже меню-бара.
     var hudSize: CGSize { isCutout ? CGSize(width: notchSize.width + 210, height: notchSize.height) : CGSize(width: 250, height: max(menuBarHeight, 24) + 18) }
-    /// Зона наведения в свёрнутом виде (шире самой чёлки — чтобы было легко попасть).
-    var hoverSize: CGSize {
-        isCutout
-            ? CGSize(width: notchSize.width + 100, height: notchSize.height + 6)
-            : CGSize(width: 270, height: max(menuBarHeight, 24) + 6)
-    }
-
     // Полоса шаблонов раскладки окон: плитки фиксированного размера, чтобы попадание курсора
     // считалось по тем же числам, по которым они нарисованы.
     static let layoutTile = CGSize(width: 50, height: 32)
@@ -215,7 +208,8 @@ final class NotchController {
         if model.isOpen {
             r = g.screenRect(for: g.openSize).insetBy(dx: -6, dy: -6)
         } else {
-            r = g.screenRect(for: g.size(for: model.mode)).union(g.screenRect(for: g.hoverSize))
+            // Ровно по видимой форме (с запасом 2 pt): панель не раскрывается, пока курсор не на самой чёлке.
+            r = g.screenRect(for: g.size(for: model.mode)).insetBy(dx: -2, dy: -2)
         }
         r.size.height += 20
         return r
