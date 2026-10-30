@@ -55,10 +55,62 @@ enum TranslateGoogle {
         var errorDescription: String? {
             switch self {
             case .badResponse: return "непонятный ответ сервера"
+            case .http(429): return "Google временно ограничил переводы — подождите минуту или включите переводчик Apple в настройках"
             case .http(let code): return "сервер ответил \(code)"
             }
         }
     }
+
+    static func isRateLimit(_ error: Error) -> Bool {
+        if case Failure.http(let code) = error { return code == 429 }
+        return false
+    }
+
+    /// Бесплатные адреса Google: у каждого свой лимит. Ответил 429 — минуту его не трогаем и пробуем следующий.
+    private enum Endpoint: CaseIterable {
+        case googleapis, google, clients5
+
+        func url(_ text: String, from: String, to: String) -> URL? {
+            let q = "sl=\(TranslateGoogle.encode(from))&tl=\(TranslateGoogle.encode(to))&q=\(TranslateGoogle.encode(text))"
+            switch self {
+            case .googleapis: return URL(string: "https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&" + q)
+            case .google: return URL(string: "https://translate.google.com/translate_a/single?client=gtx&dt=t&" + q)
+            case .clients5: return URL(string: "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&" + q)
+            }
+        }
+    }
+
+    /// Кэш переводов и «остывающие» адреса. Доступ из разных задач — под замком.
+    private final class State {
+        private let lock = NSLock()
+        private var cooldown: [Endpoint: Date] = [:]
+        private var cache: [String: String] = [:]
+        private var order: [String] = []
+
+        func cached(_ key: String) -> String? {
+            lock.lock(); defer { lock.unlock() }
+            return cache[key]
+        }
+
+        func store(_ key: String, _ value: String) {
+            lock.lock(); defer { lock.unlock() }
+            if cache[key] == nil { order.append(key) }
+            cache[key] = value
+            if order.count > 300 { cache[order.removeFirst()] = nil }
+        }
+
+        func available(_ e: Endpoint) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            return (cooldown[e] ?? .distantPast) < Date()
+        }
+
+        func coolDown(_ e: Endpoint) {
+            lock.lock(); defer { lock.unlock() }
+            cooldown[e] = Date().addingTimeInterval(60)
+        }
+    }
+
+    private static let state = State()
 
     private static let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
     private static let chunkLimit = 1400
@@ -114,19 +166,39 @@ enum TranslateGoogle {
     static func translateChunk(_ text: String, from: String, to: String) async throws -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return text }
-        let urlString = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=\(encode(from))&tl=\(encode(to))&dt=t&q=\(encode(text))"
-        guard let url = URL(string: urlString) else { throw Failure.badResponse }
+        let key = from + "|" + to + "|" + text
+        if let hit = state.cached(key) { return hit }
+        var lastError: Error = Failure.http(429)   // все адреса «остывают»
+        for endpoint in Endpoint.allCases where state.available(endpoint) {
+            do {
+                let result = try await request(endpoint, text: text, from: from, to: to)
+                state.store(key, result)
+                return result
+            } catch Failure.http(let code) where code == 429 || code >= 500 {
+                state.coolDown(endpoint)
+                lastError = Failure.http(code)
+            }
+        }
+        throw lastError
+    }
+
+    private static func request(_ endpoint: Endpoint, text: String, from: String, to: String) async throws -> String {
+        guard let url = endpoint.url(text, from: from, to: to) else { throw Failure.badResponse }
         var req = URLRequest(url: url)
         req.timeoutInterval = 15
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: req)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 { throw Failure.http(http.statusCode) }
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [Any],
-              let sentences = root.first as? [Any] else { throw Failure.badResponse }
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [Any] else { throw Failure.badResponse }
+        // translate_a/t: ["перевод"] или [["перевод","en"]]; translate_a/single: [[["кусок","оригинал",…],…],…]
+        if let s = root.first as? String { return s }
+        guard let first = root.first as? [Any] else { throw Failure.badResponse }
+        if let s = first.first as? String { return s }
         var out = ""
-        for item in sentences {
+        for item in first {
             if let arr = item as? [Any], let piece = arr.first as? String { out += piece }
         }
+        guard !out.isEmpty else { throw Failure.badResponse }
         return out
     }
 
@@ -408,7 +480,8 @@ final class TranslateModel: ObservableObject {
             self.translateNow()
         }
         work = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: w)
+        // Живой перевод — не на каждую букву: Google ограничивает частые запросы.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7, execute: w)
     }
 
     func translateNow() {
@@ -440,6 +513,11 @@ final class TranslateModel: ObservableObject {
                 await MainActor.run {
                     guard gen == self.generation else { return }
                     self.isWorking = false
+                    // Google ограничил запросы — перевести на самом Mac переводчиком Apple.
+                    if TranslateGoogle.isRateLimit(error), !from.apple.isEmpty, !to.apple.isEmpty {
+                        self.startApple(.text(text), from: from, to: to)
+                        return
+                    }
                     self.errorText = "Не удалось перевести: \(error.localizedDescription)"
                 }
             }
@@ -633,6 +711,10 @@ final class TranslateModel: ObservableObject {
                 await MainActor.run {
                     guard gen == self.generation else { return }
                     self.isWorking = false
+                    if TranslateGoogle.isRateLimit(error), !from.apple.isEmpty, !to.apple.isEmpty {
+                        self.startApple(.lines(lines), from: from, to: to)
+                        return
+                    }
                     self.photoStatus = "Не удалось перевести"
                     self.errorText = "Не удалось перевести: \(error.localizedDescription)"
                 }
