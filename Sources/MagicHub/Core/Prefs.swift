@@ -19,6 +19,11 @@ final class Prefs: ObservableObject {
 
     @Published var autoUpdateCheck: Bool = Prefs.bool("autoUpdateCheck", true) { didSet { Prefs.d.set(autoUpdateCheck, forKey: "autoUpdateCheck") } }
 
+    /// Уведомления macOS из Центра уведомлений — в чёлке.
+    @Published var systemNotifications: Bool = Prefs.bool("systemNotifications", true) { didSet { Prefs.d.set(systemNotifications, forKey: "systemNotifications") } }
+    /// Сколько секунд висит уведомление в чёлке.
+    @Published var notifSeconds: Double = Prefs.double("notifSeconds", 6) { didSet { Prefs.d.set(notifSeconds, forKey: "notifSeconds") } }
+
     /// Файл, который тащат к чёлке, открывает полку.
     @Published var shelfDragOpen: Bool = Prefs.bool("shelfDragOpen", true) { didSet { Prefs.d.set(shelfDragOpen, forKey: "shelfDragOpen") } }
     /// Окно, которое тащат к чёлке, показывает шаблоны раскладки.

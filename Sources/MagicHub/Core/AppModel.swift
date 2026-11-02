@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 enum Tab: String, CaseIterable, Identifiable {
     case music, shelf, clipboard, snippets, calendar, translate, notes
@@ -53,7 +54,7 @@ enum Tab: String, CaseIterable, Identifiable {
 
 /// Уведомление, которое выезжает из чёлки (например, «Джарвис принял задачу»).
 struct NotchNotification: Identifiable, Equatable {
-    enum Kind { case progress, success, warning, error, info }
+    enum Kind { case progress, success, warning, error, info, message }
 
     let id = UUID()
     var title: String
@@ -61,12 +62,15 @@ struct NotchNotification: Identifiable, Equatable {
     var kind: Kind
     /// SF Symbol слева. По умолчанию — значок Джарвиса.
     var icon: String = "sparkles"
+    /// Значок приложения слева (уведомления macOS) — вместо SF Symbol.
+    var appIcon: NSImage? = nil
     /// Что сделать по клику на уведомление (по умолчанию — открыть вкладку «ИИ-агенты»).
     var onTap: (() -> Void)? = nil
 
     var color: Color {
         switch kind {
         case .progress, .info: return MH.accent
+        case .message: return MH.t1
         case .success: return MH.green
         case .warning: return MH.orange
         case .error: return MH.red
@@ -93,6 +97,8 @@ final class AppModel: ObservableObject {
     @Published var dragURLs: [URL] = []
     /// До этого момента панель не сворачивается (например, сразу после смены размера).
     var holdOpenUntil = Date.distantPast
+    /// Когда панель последний раз сворачивали: через 10 минут без хаба он снова открывается на «Музыке».
+    var lastPanelClose = Date()
 
     func holdOpen(for seconds: TimeInterval) { holdOpenUntil = Date().addingTimeInterval(seconds) }
     /// Уведомление, которое сейчас показывается в чёлке.
@@ -110,10 +116,13 @@ final class AppModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
     }
 
-    /// Показать уведомление в чёлке (очередь, по 4,5 с каждое).
+    /// Показать уведомление в чёлке. Очередь; каждое висит ровно своё время (настройка «Показывать
+    /// уведомление»), наведение и раскрытие хаба его не убирают.
     func post(_ n: NotchNotification) {
         DispatchQueue.main.async {
             self.queue.append(n)
+            // Поток уведомлений (например, сообщений в чате) — не копить очередь на минуты вперёд.
+            if self.queue.count > 4 { self.queue.removeFirst(self.queue.count - 4) }
             if self.notification == nil { self.showNext() }
         }
     }
@@ -123,7 +132,7 @@ final class AppModel: ObservableObject {
         notification = queue.removeFirst()
         let work = DispatchWorkItem { [weak self] in self?.showNext() }
         notifWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.5, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(2, Prefs.shared.notifSeconds), execute: work)
     }
 
     func dismissNotification() {
@@ -133,7 +142,10 @@ final class AppModel: ObservableObject {
 
     /// Открыть панель (на нужной вкладке).
     func open(_ tab: Tab? = nil) {
-        if let tab { self.tab = tab }
+        if let tab {
+            self.tab = tab
+            lastPanelClose = Date()   // вкладку выбрали явно — не подменять её «Музыкой»
+        }
         NotchManager.shared.openOnActiveScreen()
     }
 }

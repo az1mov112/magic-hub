@@ -31,8 +31,10 @@ struct JarvisState: Equatable {
     var medianTurn: TimeInterval?
     var lastTurnDuration: TimeInterval?
     var restartsToday = 0
-    /// Основной ход закончен, но фоновые агенты ещё пишут свои журналы.
+    /// Основной ход закончен, но фоновые агенты ещё работают.
     var background = false
+    /// Сколько фоновых агентов сейчас работает.
+    var agents = 0
 
     var lastIssue: JarvisIssue? { lastError.map { JarvisIssue.classify($0, code: lastErrorCode) } }
 
@@ -62,6 +64,11 @@ final class JarvisMonitor: ObservableObject {
     private var notifiedDown = false
     private var cachedLabel: (label: String, plist: String)?
     private var parseCache: (url: URL, size: UInt64, mtime: Date, result: SessionParse)?
+    /// Когда Джарвис стал занят и когда освободился — для «закончил за …».
+    private var busySince: Date?
+    private var freeSince: Date?
+    /// Журнал агента → работает ли он (ключ — путь и время изменения).
+    private var agentCache: [String: (mtime: Date, running: Bool)] = [:]
     /// Файл сессии → есть ли в нём сообщения из Telegram (ключ — путь и время изменения).
     private var channelCache: [String: (mtime: Date, hasChannel: Bool)] = [:]
 
@@ -189,10 +196,14 @@ final class JarvisMonitor: ObservableObject {
             s.busy = parse.busy
             s.lastActivity = parse.lastActivity
             background = Self.backgroundWrites(forProject: dir, main: file)
-            if let bg = background.first?.1, Date().timeIntervalSince(bg) < 90 {
+            // Агент работает, пока его журнал не закончился итоговым ответом — даже если он минутами
+            // думает или ждёт долгую команду и ничего не пишет.
+            s.agents = runningSubagents(forProject: dir, main: file)
+            let recentWrite = background.first.map { Date().timeIntervalSince($0.1) < 90 } ?? false
+            if s.agents > 0 || recentWrite {
                 s.background = !parse.busy
                 s.busy = true
-                if bg > (s.lastActivity ?? .distantPast) { s.lastActivity = bg }
+                if let bg = background.first?.1, bg > (s.lastActivity ?? .distantPast) { s.lastActivity = bg }
             }
             s.currentTask = parse.lastTask
             s.taskStarted = parse.lastTaskDate
@@ -399,6 +410,7 @@ final class JarvisMonitor: ObservableObject {
         guard initialized else {
             seenTaskDate = s.taskStarted
             seenErrorDate = s.lastErrorDate
+            if s.busy { busySince = Date() }
             return
         }
         let prefs = Prefs.shared
@@ -411,11 +423,25 @@ final class JarvisMonitor: ObservableObject {
                                                        kind: .progress))
             }
         }
-        if prev.busy && !s.busy && prev.found && prefs.evTaskDone {
-            let took = s.lastTurnDuration.map { "за " + Fmt.duration($0) } ?? ""
-            AppModel.shared.post(NotchNotification(title: "Джарвис закончил задачу",
-                                                   subtitle: [Self.short(s.currentTask ?? "", 40), took].filter { !$0.isEmpty }.joined(separator: " · "),
-                                                   kind: .success))
+        // «Закончил»: время — от прихода задачи до конца всей работы (с агентами), а не последнего шага.
+        // Короткие паузы между шагами и агентами задачу не заканчивают: ждём 8 с свободы.
+        if s.busy {
+            if busySince == nil {
+                busySince = s.taskStarted.flatMap { Date().timeIntervalSince($0) < 600 ? $0 : nil } ?? Date()
+            }
+            freeSince = nil
+        } else if let started = busySince, s.found {
+            if freeSince == nil { freeSince = Date() }
+            if let free = freeSince, Date().timeIntervalSince(free) >= 8 {
+                busySince = nil
+                freeSince = nil
+                if prefs.evTaskDone {
+                    let took = "за " + Fmt.duration(max(1, free.timeIntervalSince(started)))
+                    AppModel.shared.post(NotchNotification(title: "Джарвис закончил задачу",
+                                                           subtitle: [Self.short(s.currentTask ?? "", 40), took].filter { !$0.isEmpty }.joined(separator: " · "),
+                                                           kind: .success))
+                }
+            }
         }
         if let d = s.lastErrorDate, d > (seenErrorDate ?? .distantPast) {
             seenErrorDate = d
@@ -679,7 +705,7 @@ final class JarvisMonitor: ObservableObject {
             l.append("другая активность за сутки: \(bg.count)")
             for b in bg.prefix(8) { l.append("  \(b.0): \(Self.agoShort(b.1))") }
         }
-        l.append("итог: занят=\(s.busy ? "да" : "нет"), в фоне=\(s.background ? "да" : "нет"), завис=\(s.hung ? "да" : "нет"), задача=\(s.currentTask == nil ? "нет" : "есть")")
+        l.append("итог: занят=\(s.busy ? "да" : "нет"), в фоне=\(s.background ? "да" : "нет"), агентов=\(s.agents), завис=\(s.hung ? "да" : "нет"), задача=\(s.currentTask == nil ? "нет" : "есть")")
         return l.joined(separator: "\n")
     }
 
@@ -722,6 +748,59 @@ final class JarvisMonitor: ObservableObject {
         let home = AppPaths.home.path
         let encodedHome = String(home.map { $0.isLetter || $0.isNumber ? $0 : "-" })
         return path.replacingOccurrences(of: home, with: "~").replacingOccurrences(of: encodedHome, with: "~")
+    }
+
+    /// Работающие фоновые агенты основной сессии: журнал менялся за последние 15 минут
+    /// и последняя запись — не итоговый ответ (а задание, вызов инструмента или его результат).
+    private func runningSubagents(forProject path: String, main: URL) -> Int {
+        let dir = Self.projectDir(for: path)
+        let fm = FileManager.default
+        let fresh = Date().addingTimeInterval(-15 * 60)
+        var files: [URL] = []
+        let sessionDir = dir.appendingPathComponent(main.deletingPathExtension().lastPathComponent)
+        if let e = fm.enumerator(at: sessionDir, includingPropertiesForKeys: [.contentModificationDateKey]) {
+            for case let f as URL in e where f.pathExtension == "jsonl" { files.append(f) }
+        }
+        let top = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        files += top.filter { $0.lastPathComponent.hasPrefix("agent-") && $0.pathExtension == "jsonl" }
+
+        var count = 0
+        for f in files {
+            guard let m = Self.mtime(f), m > fresh else { continue }
+            let running: Bool
+            if let c = agentCache[f.path], c.mtime == m {
+                running = c.running
+            } else {
+                running = Self.subagentRunning(f)
+                agentCache[f.path] = (m, running)
+            }
+            if running { count += 1 }
+        }
+        if agentCache.count > 200 { agentCache = agentCache.filter { $0.value.mtime > fresh } }
+        return count
+    }
+
+    static func subagentRunning(_ url: URL) -> Bool {
+        guard let text = tail(of: url, bytes: 256 * 1024) else { return false }
+        for line in text.split(separator: "\n").reversed() {
+            guard let data = line.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let message = o["message"] as? [String: Any]
+            switch o["type"] as? String {
+            case "user":
+                return true   // задание или результат инструмента — агент ждёт ответа модели
+            case "assistant":
+                if (message?["stop_reason"] as? String) == "end_turn" { return false }
+                let blocks = message?["content"] as? [[String: Any]] ?? []
+                let types = Set(blocks.compactMap { $0["type"] as? String })
+                if types.contains("tool_use") { return true }
+                if types.contains("text") { return false }   // итоговый ответ
+                return true                                    // пока только размышления
+            default:
+                continue
+            }
+        }
+        return false
     }
 
     static func tail(of url: URL, bytes: Int) -> String? {

@@ -220,11 +220,18 @@ private struct NotificationContent: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: notification.icon)
-                .font(.system(size: 17, weight: .medium))
-                .foregroundStyle(notification.color)
-                .frame(width: 38, height: 38)
-                .background(Circle().fill(MH.card2))
+            if let appIcon = notification.appIcon {
+                Image(nsImage: appIcon)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 38, height: 38)
+            } else {
+                Image(systemName: notification.icon)
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(notification.color)
+                    .frame(width: 38, height: 38)
+                    .background(Circle().fill(MH.card2))
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(notification.title).font(.system(size: 14, weight: .semibold)).foregroundStyle(MH.t1).lineLimit(1)
                 if !notification.subtitle.isEmpty {
@@ -242,6 +249,8 @@ private struct NotificationContent: View {
                     Image(systemName: "exclamationmark.triangle").font(.system(size: 18))
                 case .info:
                     Image(systemName: "arrow.clockwise").font(.system(size: 18))
+                case .message:
+                    EmptyView()
                 }
             }
             .foregroundStyle(notification.color)

@@ -73,6 +73,7 @@ struct SettingsTabView: View {
                 WindowsSettingsSection()
                 MenuBarSettingsSection()
                 NotificationsSettingsSection()
+                SystemNotificationsSettingsSection()
                 ClipboardSettingsSection()
                 CalendarSettingsSection()
                 TranslateSettingsSection()

@@ -300,9 +300,12 @@ final class NotchController {
         cancelOpen()
         cancelClose()
         guard !model.isOpen else { return }
+        let app = AppModel.shared
+        // Хаб не раскрывали больше 10 минут — начать с «Музыки».
+        if Date().timeIntervalSince(app.lastPanelClose) > 600, Prefs.shared.isVisible(.music) { app.tab = .music }
         model.isOpen = true
         panel.ignoresMouseEvents = false
-        if AppModel.shared.notification != nil { AppModel.shared.dismissNotification() }
+        // Уведомление не убираем: оно висит своё время и вернётся, если свернуть хаб раньше.
     }
 
     func close() {
@@ -311,6 +314,7 @@ final class NotchController {
         guard model.isOpen else { return }
         model.isOpen = false
         AppModel.shared.pinnedOpen = false
+        AppModel.shared.lastPanelClose = Date()
         panel.makeFirstResponder(nil)
         handleMove(NSEvent.mouseLocation)
     }
