@@ -115,19 +115,27 @@ final class SystemNotificationsMonitor: ObservableObject {
         return sqlite3_column_int64(stmt, 0)
     }
 
+    /// Есть ли в базе поле presented (показан ли баннер). nil — ещё не проверяли.
+    private var hasPresentedColumn: Bool?
+
     private func readNew() {
-        let sql = """
-            SELECT r.rec_id, a.identifier, r.data FROM record r JOIN app a ON a.app_id = r.app_id \
-            WHERE r.rec_id > ? ORDER BY r.rec_id LIMIT 20
-            """
+        let withPresented = hasPresentedColumn ?? true
+        let sql = "SELECT r.rec_id, a.identifier, r.data" + (withPresented ? ", r.presented" : "")
+            + " FROM record r JOIN app a ON a.app_id = r.app_id WHERE r.rec_id > ? ORDER BY r.rec_id LIMIT 20"
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            failQuery()
+            if withPresented && hasPresentedColumn == nil {
+                hasPresentedColumn = false   // старая схема без presented — читать без него
+                readNew()
+            } else {
+                failQuery()
+            }
             return
         }
+        hasPresentedColumn = withPresented
         sqlite3_bind_int64(stmt, 1, lastRecID)
-        var rows: [(id: Int64, app: String, data: Data)] = []
+        var rows: [(id: Int64, app: String, data: Data, presented: Bool)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = sqlite3_column_int64(stmt, 0)
             let app = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
@@ -135,11 +143,16 @@ final class SystemNotificationsMonitor: ObservableObject {
             if let blob = sqlite3_column_blob(stmt, 2) {
                 data = Data(bytes: blob, count: Int(sqlite3_column_bytes(stmt, 2)))
             }
-            rows.append((id, app, data))
+            let presented = withPresented ? sqlite3_column_int(stmt, 3) != 0 : true
+            rows.append((id, app, data, presented))
         }
         if case .working = status {} else { setStatus(.working) }
+        // Фокус (на Mac или с iPhone): уведомления, которые он заглушил, в хаб не попадают —
+        // показываем только те, что macOS пропустила сквозь фокус.
+        let focus = !rows.isEmpty && FocusState.isActive()
         for row in rows {
             lastRecID = max(lastRecID, row.id)
+            if focus && !row.presented { continue }
             present(row.app, row.data)
         }
     }
@@ -156,6 +169,7 @@ final class SystemNotificationsMonitor: ObservableObject {
     }
 
     private func closeDB() {
+        hasPresentedColumn = nil
         walSource?.cancel()
         walSource = nil
         if let db { sqlite3_close(db) }
@@ -237,10 +251,12 @@ final class SystemNotificationsMonitor: ObservableObject {
         // Три последние записи — только приложение и названия полей.
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        if sqlite3_prepare_v2(handle, "SELECT r.rec_id, a.identifier, r.data FROM record r JOIN app a ON a.app_id = r.app_id ORDER BY r.rec_id DESC LIMIT 3", -1, &stmt, nil) == SQLITE_OK {
+        l.append("фокус сейчас: " + (FocusState.isActive() ? "включён" : "выключен") + " (" + FocusState.summary() + ")")
+        if sqlite3_prepare_v2(handle, "SELECT r.rec_id, a.identifier, r.data, r.presented, r.style FROM record r JOIN app a ON a.app_id = r.app_id ORDER BY r.rec_id DESC LIMIT 5", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let id = sqlite3_column_int64(stmt, 0)
-                let app = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "?"
+                let shown = "presented=\(sqlite3_column_int(stmt, 3)) style=\(sqlite3_column_int(stmt, 4))"
+                let app = (sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "?") + " " + shown
                 var keys = "?"
                 if let blob = sqlite3_column_blob(stmt, 2) {
                     let data = Data(bytes: blob, count: Int(sqlite3_column_bytes(stmt, 2)))
@@ -350,6 +366,47 @@ final class SystemNotificationsMonitor: ObservableObject {
     }
 }
 
+/// Включён ли фокус — на этом Mac или пришедший с iPhone («Общий доступ между устройствами»).
+/// donotdisturbd записывает активные фокусы в ~/Library/DoNotDisturb/DB/Assertions.json
+/// (читается с «Полным доступом к диску»).
+enum FocusState {
+    private static let lock = NSLock()
+    private static var cache: (date: Date, active: Bool, summary: String)?
+
+    static func isActive() -> Bool { read().active }
+    static func summary() -> String { read().summary }
+
+    private static func read() -> (active: Bool, summary: String) {
+        lock.lock(); defer { lock.unlock() }
+        if let c = cache, Date().timeIntervalSince(c.date) < 2 { return (c.active, c.summary) }
+        let url = AppPaths.home.appendingPathComponent("Library/DoNotDisturb/DB/Assertions.json")
+        var active = false
+        var summary = "файл фокуса не читается"
+        if let data = try? Data(contentsOf: url),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let stores = root["data"] as? [[String: Any]] ?? []
+            var modes: [String] = []
+            for store in stores {
+                let assertions = store["storeAssertionRecords"] as? [[String: Any]] ?? []
+                // Завершённые фокусы перечислены в storeInvalidationRecords.
+                let invalidated = Set((store["storeInvalidationRecords"] as? [[String: Any]] ?? []).compactMap { rec -> String? in
+                    (rec["invalidationAssertion"] as? [String: Any])?["assertionUUID"] as? String ?? rec["assertionUUID"] as? String
+                })
+                for a in assertions where !invalidated.contains(a["assertionUUID"] as? String ?? "") {
+                    active = true
+                    let details = a["assertionDetails"] as? [String: Any]
+                    modes.append((details?["assertionDetailsModeIdentifier"] as? String ?? "?")
+                        .replacingOccurrences(of: "com.apple.donotdisturb.mode.", with: "")
+                        .replacingOccurrences(of: "com.apple.focus.", with: ""))
+                }
+            }
+            summary = modes.isEmpty ? "активных нет" : "активные: " + modes.joined(separator: ", ")
+        }
+        cache = (Date(), active, summary)
+        return (active, summary)
+    }
+}
+
 /// Настройки: уведомления Mac в чёлке.
 struct SystemNotificationsSettingsSection: View {
     @ObservedObject private var prefs = Prefs.shared
@@ -383,17 +440,16 @@ struct SystemNotificationsSettingsSection: View {
                     SettingsRow("Работает", subtitle: "Уведомления приходят в чёлку") {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(MH.green)
                     }
-                    SettingsButtonRow("Без баннеров macOS совсем",
-                                      subtitle: "Включите фокус «Не беспокоить» (Пункт управления → Фокусирование) до отключения и выключите «Общий доступ между устройствами». Баннеров не будет ни от одного приложения, а уведомления продолжат приходить в чёлку",
-                                      buttonTitle: "Настройки фокуса") {
-                        if let url = URL(string: "x-apple.systempreferences:com.apple.Focus-Settings.extension") { NSWorkspace.shared.open(url) }
+                    SettingsRow("Фокус уважается",
+                                subtitle: "Пока включён фокус (на Mac или с iPhone), в чёлку приходят только уведомления, которые он пропустил") {
+                        Image(systemName: "moon.fill").foregroundStyle(MH.t2)
                     }
                     SettingsToggleRow("Звук уведомления",
-                                      subtitle: "В «Не беспокоить» macOS молчит — звук сыграет хаб",
+                                      subtitle: "Если у приложения баннер выключен и macOS молчит — звук сыграет хаб",
                                       isOn: $prefs.notifSound)
                     if !monitor.recentApps.isEmpty {
-                        SettingsRow("Или отключить баннер у отдельных приложений",
-                                    subtitle: "Стиль «Нет» — баннера не будет, уведомления останутся в чёлке") { EmptyView() }
+                        SettingsRow("Чтобы баннеры macOS не дублировали чёлку",
+                                    subtitle: "Отключите баннер у приложения (стиль «Нет») — его уведомления останутся в чёлке") { EmptyView() }
                         ForEach(monitor.recentApps) { app in
                             HStack(spacing: 10) {
                                 if let icon = app.icon {

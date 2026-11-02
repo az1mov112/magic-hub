@@ -3,7 +3,7 @@ import AppKit
 
 enum Tab: String, CaseIterable, Identifiable {
     case music, shelf, clipboard, snippets, calendar, translate, notes
-    case currency, teleprompter, calculator, ai, awake, settings
+    case currency, teleprompter, calculator, ai, awake, notifications, settings
 
     var id: String { rawValue }
 
@@ -21,6 +21,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .calculator: return "Калькулятор"
         case .ai: return "ИИ-агенты"
         case .awake: return "Не спать"
+        case .notifications: return "Уведомления"
         case .settings: return "Настройки"
         }
     }
@@ -39,6 +40,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .calculator: return "plus.forwardslash.minus"
         case .ai: return "sparkles"
         case .awake: return "moon.zzz"
+        case .notifications: return "bell"
         case .settings: return "gearshape"
         }
     }
@@ -64,6 +66,8 @@ struct NotchNotification: Identifiable, Equatable {
     var icon: String = "sparkles"
     /// Значок приложения слева (уведомления macOS) — вместо SF Symbol.
     var appIcon: NSImage? = nil
+    /// Приложение-источник (bundle id) — для истории уведомлений.
+    var source: String? = nil
     /// Что сделать по клику на уведомление (по умолчанию — открыть вкладку «ИИ-агенты»).
     var onTap: (() -> Void)? = nil
 
@@ -120,6 +124,7 @@ final class AppModel: ObservableObject {
     /// уведомление»), наведение и раскрытие хаба его не убирают.
     func post(_ n: NotchNotification) {
         DispatchQueue.main.async {
+            NotificationHistory.shared.add(n)
             self.queue.append(n)
             // Поток уведомлений (например, сообщений в чате) — не копить очередь на минуты вперёд.
             if self.queue.count > 4 { self.queue.removeFirst(self.queue.count - 4) }

@@ -393,6 +393,7 @@ struct PanelView: View {
         case .calculator: CalculatorTabView()
         case .ai: AITabView()
         case .awake: AwakeTabView()
+        case .notifications: NotificationsTabView()
         case .settings: SettingsTabView()
         }
     }
