@@ -70,6 +70,8 @@ struct NotchNotification: Identifiable, Equatable {
     var source: String? = nil
     /// Что сделать по клику на уведомление (по умолчанию — открыть вкладку «ИИ-агенты»).
     var onTap: (() -> Void)? = nil
+    /// Вызывается, когда уведомление появилось в чёлке (замер скорости).
+    var onShown: (() -> Void)? = nil
 
     var color: Color {
         switch kind {
@@ -108,7 +110,9 @@ final class AppModel: ObservableObject {
     /// Уведомление, которое сейчас показывается в чёлке.
     @Published private(set) var notification: NotchNotification?
 
-    private var queue: [NotchNotification] = []
+    /// Пришедшее, пока висит другое: сменит его, как только то провисит минимум.
+    private var pending: NotchNotification?
+    private var shownAt = Date.distantPast
     private var toastWork: DispatchWorkItem?
     private var notifWork: DispatchWorkItem?
 
@@ -120,29 +124,43 @@ final class AppModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
     }
 
-    /// Показать уведомление в чёлке. Очередь; каждое висит ровно своё время (настройка «Показывать
-    /// уведомление»), наведение и раскрытие хаба его не убирают.
+    /// Показать уведомление в чёлке. Каждое висит своё время (настройка «Сколько висит уведомление»),
+    /// наведение и раскрытие хаба его не убирают. Новое не ждёт, пока старое досидит до конца:
+    /// сменяет его, как только то провисело полторы секунды (все остаются в истории).
     func post(_ n: NotchNotification) {
         DispatchQueue.main.async {
             NotificationHistory.shared.add(n)
-            self.queue.append(n)
-            // Поток уведомлений (например, сообщений в чате) — не копить очередь на минуты вперёд.
-            if self.queue.count > 4 { self.queue.removeFirst(self.queue.count - 4) }
-            if self.notification == nil { self.showNext() }
+            guard self.notification != nil else { self.show(n); return }
+            self.pending = n   // из нескольких пришедших подряд показываем самое свежее
+            let wait = max(0, Self.minVisible - Date().timeIntervalSince(self.shownAt))
+            self.schedule(after: wait)
         }
     }
 
-    private func showNext() {
-        guard !queue.isEmpty else { notification = nil; return }
-        notification = queue.removeFirst()
-        let work = DispatchWorkItem { [weak self] in self?.showNext() }
+    private static let minVisible: TimeInterval = 1.5
+
+    private func show(_ n: NotchNotification) {
+        pending = nil
+        notification = n
+        shownAt = Date()
+        n.onShown?()
+        schedule(after: max(2, Prefs.shared.notifSeconds))
+    }
+
+    private func schedule(after seconds: TimeInterval) {
+        notifWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.advance() }
         notifWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(2, Prefs.shared.notifSeconds), execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
+    private func advance() {
+        if let next = pending { show(next) } else { notification = nil }
     }
 
     func dismissNotification() {
         notifWork?.cancel()
-        showNext()
+        advance()
     }
 
     /// Открыть панель (на нужной вкладке).

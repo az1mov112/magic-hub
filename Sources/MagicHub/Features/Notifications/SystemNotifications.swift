@@ -23,15 +23,47 @@ final class SystemNotificationsMonitor: ObservableObject {
     }
     @Published private(set) var recentApps: [RecentApp] = []
 
-    private let queue = DispatchQueue(label: "app.magichub.system-notifications", qos: .utility)
+    /// Скорость последнего уведомления — для строки в настройках.
+    struct Speed: Equatable {
+        /// От доставки в macOS до появления в чёлке, с.
+        let total: Double
+        /// Сколько из этого macOS не записывала уведомление в базу (нижняя оценка), с.
+        let system: Double
+    }
+    @Published private(set) var lastSpeed: Speed?
+
+    private let queue = DispatchQueue(label: "app.magichub.system-notifications", qos: .userInitiated)
     private var db: OpaquePointer?
+    private var dbURL: URL?
     private var lastRecID: Int64 = -1
+    /// Время запуска слежения (секунды от 2001 года): старые уведомления не показываем.
+    private var startRef: Double = 0
+    /// Уже известные записи (uuid → когда). Номер записи macOS может выдать повторно, если удалила
+    /// последнюю (сообщение прочитали на телефоне), поэтому новые записи узнаём ещё и по uuid.
+    private var seen: [String: Date] = [:]
     private var timer: DispatchSourceTimer?
+    /// Без этого macOS усыпляет фоновое приложение (App Nap) и придерживает его таймеры на секунды.
+    private var activity: NSObjectProtocol?
+    private var napDisabled = false   // то же, но для чтения на queue
     /// Слежение за журналом базы (-wal): macOS сама сообщает о новой записи — без задержки опроса.
     private var walSource: DispatchSourceFileSystemObject?
     private var followUpScheduled = false
-    /// Задержки последних уведомлений: от доставки macOS до показа в чёлке (для диагностики).
-    private var latencies: [TimeInterval] = []
+
+    // Замеры для диагностики.
+    private struct Timing {
+        let id = UUID()
+        let app: String
+        let delivered: Date
+        /// Предыдущая проверка базы, которая этой записи ещё не нашла.
+        let prevPoll: Date?
+        let read: Date
+        var shown: Date?
+    }
+    private var timings: [Timing] = []
+    private var pollTimes: [Date] = []
+    private var pollDurations: [Double] = []
+    private var walEvents: [Date] = []
+    private var lastPoll: Date?
     private var cancellables = Set<AnyCancellable>()
     private var recent: [String: Date] = [:]
     private var icons: [String: NSImage] = [:]
@@ -57,11 +89,23 @@ final class SystemNotificationsMonitor: ObservableObject {
     private func schedule(on: Bool, lite: Bool) {
         timer?.cancel()
         timer = nil
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        activity = nil
         guard on else {
-            queue.async { [weak self] in self?.closeDB() }
+            queue.async { [weak self] in
+                self?.closeDB()
+                self?.lastRecID = -1   // после включения — только новые, без накопившихся
+                self?.napDisabled = false
+            }
             status = .off
             return
         }
+        // Не даём macOS «усыплять» хаб: иначе проверка 4 раза в секунду на деле идёт раз в несколько секунд.
+        // На сон Mac и экрана это не влияет.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: lite ? [.userInitiatedAllowingIdleSystemSleep] : [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+            reason: "Уведомления Mac в чёлке")
+        queue.async { [weak self] in self?.napDisabled = true }
         // Основной путь — событие записи в журнал базы; опрос — запасной (если событие не пришло).
         let t = DispatchSource.makeTimerSource(queue: queue)
         // Проверка — один короткий запрос к открытой базе, поэтому почти непрерывно: 4 раза в секунду.
@@ -86,7 +130,15 @@ final class SystemNotificationsMonitor: ObservableObject {
     }
 
     private func poll() {
-        guard let url = Self.databaseURL else { setStatus(.notFound); return }
+        let started = Date()
+        defer {
+            lastPoll = started
+            pollTimes.append(started)
+            if pollTimes.count > 240 { pollTimes.removeFirst(pollTimes.count - 240) }
+            pollDurations.append(Date().timeIntervalSince(started) * 1000)
+            if pollDurations.count > 60 { pollDurations.removeFirst(pollDurations.count - 60) }
+        }
+        guard let url = dbURL ?? Self.databaseURL else { setStatus(.notFound); return }
         if db == nil {
             var handle: OpaquePointer?
             guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
@@ -96,16 +148,21 @@ final class SystemNotificationsMonitor: ObservableObject {
             }
             sqlite3_busy_timeout(handle, 250)
             db = handle
+            dbURL = url
         }
         watchJournal(url)
         // Первый запуск: старые уведомления не показываем, начинаем с самой свежей записи.
         if lastRecID < 0 {
             guard let maxID = queryMaxID() else { return }
             lastRecID = maxID
+            startRef = Date().timeIntervalSinceReferenceDate
+            // Всё, что уже лежит в базе, — старое: даже если macOS обновит запись, второй раз не показываем.
+            seen = [:]
+            for key in queryAllKeys() { seen[key] = Date() }
             setStatus(.working)
             return
         }
-        readNew()
+        readNew(prevPoll: lastPoll)
     }
 
     private func queryMaxID() -> Int64? {
@@ -119,37 +176,78 @@ final class SystemNotificationsMonitor: ObservableObject {
         return sqlite3_column_int64(stmt, 0)
     }
 
-    private func readNew() {
-        let sql = "SELECT r.rec_id, a.identifier, r.data, r.delivered_date FROM record r JOIN app a ON a.app_id = r.app_id WHERE r.rec_id > ? ORDER BY r.rec_id LIMIT 20"
+    private func queryAllKeys() -> [String] {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT rec_id, hex(uuid) FROM record", -1, &stmt, nil) == SQLITE_OK else { return [] }
+        var keys: [String] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let uuid = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+            keys.append(uuid.isEmpty ? "#\(sqlite3_column_int64(stmt, 0))" : uuid)
+        }
+        return keys
+    }
+
+    /// Новые записи: с номером больше последнего прочитанного или доставленные за последние полминуты
+    /// (номер мог достаться повторно), кроме уже показанных.
+    private func readNew(prevPoll: Date?) {
+        let sql = """
+            SELECT r.rec_id, a.identifier, r.data, r.delivered_date, hex(r.uuid) FROM record r JOIN app a ON a.app_id = r.app_id
+            WHERE r.rec_id > ? OR r.delivered_date > ? ORDER BY r.rec_id LIMIT 40
+            """
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             failQuery()
             return
         }
+        let now = Date()
         sqlite3_bind_int64(stmt, 1, lastRecID)
-        var rows: [(id: Int64, app: String, data: Data, delivered: Double)] = []
+        sqlite3_bind_double(stmt, 2, max(startRef, now.timeIntervalSinceReferenceDate - 30))
+        var rows: [(id: Int64, app: String, data: Data, delivered: Double, key: String)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = sqlite3_column_int64(stmt, 0)
+            let uuid = sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? ""
+            let key = uuid.isEmpty ? "#\(id)" : uuid
+            lastRecID = max(lastRecID, id)
+            guard seen[key] == nil else { continue }
+            seen[key] = now
             let app = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
             var data = Data()
             if let blob = sqlite3_column_blob(stmt, 2) {
                 data = Data(bytes: blob, count: Int(sqlite3_column_bytes(stmt, 2)))
             }
-            rows.append((id, app, data, sqlite3_column_double(stmt, 3)))
+            rows.append((id, app, data, sqlite3_column_double(stmt, 3), key))
         }
+        if seen.count > 3000 { seen = seen.filter { now.timeIntervalSince($0.value) < 86400 } }
         if case .working = status {} else { setStatus(.working) }
         for row in rows {
-            lastRecID = max(lastRecID, row.id)
-            // delivered_date — секунды от 2001 года (время доставки уведомления macOS).
+            // delivered_date — секунды от 2001 года (когда macOS приняла уведомление).
+            var timingID: UUID?
             if row.delivered > 0 {
-                let lag = Date().timeIntervalSince(Date(timeIntervalSinceReferenceDate: row.delivered))
+                let delivered = Date(timeIntervalSinceReferenceDate: row.delivered)
+                let lag = now.timeIntervalSince(delivered)
                 if lag >= 0 && lag < 600 {
-                    latencies.append(lag)
-                    if latencies.count > 8 { latencies.removeFirst() }
+                    let t = Timing(app: row.app, delivered: delivered, prevPoll: prevPoll, read: now)
+                    timings.append(t)
+                    if timings.count > 6 { timings.removeFirst() }
+                    timingID = t.id
                 }
             }
-            present(row.app, row.data)
+            present(row.app, row.data, timingID: timingID)
+        }
+    }
+
+    /// Уведомление появилось в чёлке — записать, сколько оно шло.
+    private func markShown(_ id: UUID) {
+        queue.async { [weak self] in
+            guard let self, let i = self.timings.firstIndex(where: { $0.id == id }) else { return }
+            let now = Date()
+            self.timings[i].shown = now
+            let t = self.timings[i]
+            let system = max(0, (t.prevPoll ?? t.delivered).timeIntervalSince(t.delivered))
+            let speed = Speed(total: now.timeIntervalSince(t.delivered), system: system)
+            DispatchQueue.main.async { self.lastSpeed = speed }
         }
     }
 
@@ -169,6 +267,7 @@ final class SystemNotificationsMonitor: ObservableObject {
         walSource = nil
         if let db { sqlite3_close(db) }
         db = nil
+        dbURL = nil
     }
 
     /// usernoted дописывает новое уведомление в db-wal — читаем сразу по событию записи.
@@ -179,6 +278,8 @@ final class SystemNotificationsMonitor: ObservableObject {
         let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename], queue: queue)
         src.setEventHandler { [weak self] in
             guard let self else { return }
+            self.walEvents.append(Date())
+            if self.walEvents.count > 64 { self.walEvents.removeFirst(self.walEvents.count - 64) }
             if !src.data.intersection([.delete, .rename]).isEmpty {
                 // Журнал пересоздан — следить за новым файлом со следующего опроса.
                 self.walSource?.cancel()
@@ -255,18 +356,21 @@ final class SystemNotificationsMonitor: ObservableObject {
         // Три последние записи — только приложение и названия полей.
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        l.append("задержка последних (доставка macOS → чтение хабом, с): "
-                 + (latencies.isEmpty ? "нет данных" : latencies.map { String(format: "%.1f", $0) }.joined(separator: ", "))
-                 + ", слежение за журналом: " + (walSource == nil ? "нет" : "есть"))
+        l += speedDetails()
         l.append("фокус сейчас: " + (MacFocus.isActive() ? "включён" : "выключен") + " (" + MacFocus.summary() + ")")
         if MacFocus.isActive() {
             l.append("настройки фокуса:")
             l += MacFocus.rulesDetails()
         }
-        if sqlite3_prepare_v2(handle, "SELECT r.rec_id, a.identifier, r.data, r.presented, r.style FROM record r JOIN app a ON a.app_id = r.app_id ORDER BY r.rec_id DESC LIMIT 5", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(handle, "SELECT r.rec_id, a.identifier, r.data, r.presented, r.style, r.request_date, r.delivered_date FROM record r JOIN app a ON a.app_id = r.app_id ORDER BY r.rec_id DESC LIMIT 5", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let id = sqlite3_column_int64(stmt, 0)
-                let shown = "presented=\(sqlite3_column_int(stmt, 3)) style=\(sqlite3_column_int(stmt, 4))"
+                let requested = sqlite3_column_double(stmt, 5), delivered = sqlite3_column_double(stmt, 6)
+                let timing = requested > 0 && delivered > 0
+                    ? String(format: " запрос→доставка %.1f с, доставлено %.0f с назад", delivered - requested,
+                             Date().timeIntervalSinceReferenceDate - delivered)
+                    : ""
+                let shown = "presented=\(sqlite3_column_int(stmt, 3)) style=\(sqlite3_column_int(stmt, 4))" + timing
                 let bundle = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "?"
                 let verdict: String
                 switch MacFocus.allows(bundle) {
@@ -291,6 +395,33 @@ final class SystemNotificationsMonitor: ObservableObject {
             l.append("последние записи: " + String(cString: sqlite3_errmsg(handle)))
         }
         return l.joined(separator: "\n")
+    }
+
+    /// Где теряется время: опрос базы, запись macOS в базу, показ в чёлке.
+    private func speedDetails() -> [String] {
+        let now = Date()
+        func f(_ x: Double) -> String { String(format: "%+.1f", x) }
+        let polls = pollTimes.filter { now.timeIntervalSince($0) < 10 }.count
+        let avg = pollDurations.isEmpty ? 0 : pollDurations.reduce(0, +) / Double(pollDurations.count)
+        let wal = walEvents.filter { now.timeIntervalSince($0) < 10 }.count
+        var l = ["проверок базы за 10 с: \(polls) (норма ~\(Prefs.shared.lite ? 10 : 40)), одна проверка: в среднем "
+                 + String(format: "%.1f", avg) + " мс, макс " + String(format: "%.1f", pollDurations.max() ?? 0) + " мс"]
+        l.append("журнал базы: " + (walSource == nil ? "не отслеживается" : "отслеживается") + ", изменений за 10 с: \(wal)"
+                 + ", App Nap: " + (napDisabled ? "отключён" : "не отключён"))
+        if timings.isEmpty {
+            l.append("скорость: уведомлений с запуска ещё не было")
+        } else {
+            l.append("последние уведомления (секунды от момента, когда macOS их приняла):")
+            for t in timings.suffix(5) {
+                let readAt = t.read.timeIntervalSince(t.delivered)
+                let before = t.prevPoll.map { f($0.timeIntervalSince(t.delivered)) } ?? "?"
+                let shown = t.shown.map { "показано " + f($0.timeIntervalSince(t.delivered)) } ?? "не показано (сменилось новым или отфильтровано)"
+                let journal = walEvents.map { $0.timeIntervalSince(t.delivered) }.filter { $0 > -2 && $0 <= readAt + 0.5 }
+                l.append("  \(t.app): в базе не было на \(before), нашлось на \(f(readAt)), \(shown); журнал менялся: "
+                         + (journal.isEmpty ? "—" : journal.prefix(8).map(f).joined(separator: ", ")))
+            }
+        }
+        return l
     }
 
     // MARK: Системные баннеры (экспериментально)
@@ -327,7 +458,7 @@ final class SystemNotificationsMonitor: ObservableObject {
 
     // MARK: Показ
 
-    private func present(_ identifier: String, _ data: Data) {
+    private func present(_ identifier: String, _ data: Data, timingID: UUID?) {
         guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return }
         let req = plist["req"] as? [String: Any] ?? [:]
         let bundle = (plist["app"] as? String) ?? identifier
@@ -367,11 +498,13 @@ final class SystemNotificationsMonitor: ObservableObject {
             icon = appURL.map { NSWorkspace.shared.icon(forFile: $0.path) }
             if let icon { icons[bundle] = icon }
         }
-        let note = NotchNotification(title: main, subtitle: second, kind: .message, icon: "bell.fill", appIcon: icon, onTap: {
+        var note = NotchNotification(title: main, subtitle: second, kind: .message, icon: "bell.fill", appIcon: icon, onTap: {
             if let appURL {
                 NSWorkspace.shared.openApplication(at: appURL, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
             }
         })
+        note.source = bundle
+        if let timingID { note.onShown = { [weak self] in self?.markShown(timingID) } }
         let name = appURL.map { FileManager.default.displayName(atPath: $0.path).replacingOccurrences(of: ".app", with: "") } ?? bundle
         DispatchQueue.main.async {
             AppModel.shared.post(note)   // без звука: родной звук приложения играет сама macOS
@@ -406,6 +539,24 @@ enum MacFocus {
     static func isActive() -> Bool { !read().modes.isEmpty }
     static func summary() -> String { read().summary }
     static func rulesDetails() -> [String] { read().rules?.details ?? ["настройки фокуса не прочитаны"] }
+
+    /// Строка для настроек: что сейчас делает фокус с уведомлениями в чёлке.
+    static func settingsSummary() -> String {
+        let s = read()
+        guard !s.modes.isEmpty else {
+            return "Пока включён фокус (на Mac или с iPhone), в чёлку приходят только уведомления, которые он пропускает"
+        }
+        func names(_ set: Set<String>) -> String {
+            let list = set.sorted().map { b -> String in
+                guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: b) else { return b }
+                return FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
+            }
+            return list.prefix(6).joined(separator: ", ") + (list.count > 6 ? " и ещё \(list.count - 6)" : "")
+        }
+        if let allowed = s.rules?.allowed { return "Сейчас включён фокус. В чёлку проходят: " + names(allowed) + " и неотложные" }
+        if let silenced = s.rules?.silenced { return "Сейчас включён фокус. Не проходят: " + names(silenced) }
+        return "Сейчас включён фокус, но его список приложений прочитать не удалось — показываются все уведомления"
+    }
 
     /// Пропускает ли включённый фокус уведомления приложения. nil — неизвестно (настройки фокуса не разобраны):
     /// тогда уведомление показываем, чтобы не терять его.
@@ -449,54 +600,104 @@ enum MacFocus {
         id.replacingOccurrences(of: "com.apple.donotdisturb.mode.", with: "").replacingOccurrences(of: "com.apple.focus.", with: "")
     }
 
-    /// Настройки фокуса из ModeConfigurations.json: какие приложения он пропускает или глушит.
-    /// Формат Apple не документирован, поэтому ищем по смыслу: идентификаторы приложений под ключами
-    /// со словами allow / deny / silence.
+    /// Какие приложения фокус пропускает или глушит. Формат Apple не документирован и меняется
+    /// от версии к версии, поэтому ищем по смыслу во всех файлах настроек фокуса: идентификаторы
+    /// приложений (и в значениях, и в ключах) внутри части, относящейся к включённому фокусу.
     private static func rules(for modeID: String) -> Rules? {
-        guard let data = try? Data(contentsOf: dir.appendingPathComponent("ModeConfigurations.json")),
-              let root = try? JSONSerialization.jsonObject(with: data),
-              let modeRoot = find(modeID, in: root, parent: nil) else { return nil }
-
-        var found: [(path: String, bundle: String)] = []
-        func walk(_ node: Any, _ path: [String]) {
-            if let d = node as? [String: Any] {
-                for (k, v) in d {
-                    let key = k.lowercased()
-                    if let str = v as? String, str.contains("."), !str.contains(" "),
-                       key.contains("bundle") || key.contains("applicationidentifier") {
-                        found.append((path.joined(separator: "."), str))
-                    }
-                    walk(v, path + [k])
-                }
-            } else if let a = node as? [Any] {
-                for v in a {
-                    if let str = v as? String, str.contains("."), !str.contains(" "), !str.contains("@"),
-                       let last = path.last?.lowercased(), last.contains("application") || last.contains("bundle") {
-                        found.append((path.joined(separator: "."), str))
-                    }
-                    walk(v, path)
+        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return nil }
+        var inMode: [(path: String, bundle: String)] = []
+        var elsewhere: [String: (example: String, count: Int)] = [:]
+        var config: [String: Any]?
+        var fileNotes: [String] = []
+        for url in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+        where url.pathExtension.lowercased() == "json" && url.lastPathComponent != "Assertions.json" {
+            let name = url.lastPathComponent
+            guard let data = try? Data(contentsOf: url), data.count < 8_000_000,
+                  let root = try? JSONSerialization.jsonObject(with: data) else {
+                fileNotes.append(name + " (не читается)")
+                continue
+            }
+            var mine = 0, other = 0
+            scan(root, path: [], inMode: false, modeID: modeID) { path, bundle, isMode in
+                let p = name + " › " + path.joined(separator: ".").replacingOccurrences(of: modeID, with: "<фокус>")
+                if isMode {
+                    inMode.append((p, bundle))
+                    mine += 1
+                } else {
+                    let e = elsewhere[p]
+                    elsewhere[p] = (e?.example ?? bundle, (e?.count ?? 0) + 1)
+                    other += 1
                 }
             }
+            if config == nil, let m = find(modeID, in: root, parent: nil) as? [String: Any] {
+                config = m["configuration"] as? [String: Any]
+            }
+            fileNotes.append("\(name) \(data.count / 1024) КБ: приложений в этом фокусе \(mine), вне его \(other)")
         }
-        walk(modeRoot, [])
 
         var allowed = Set<String>(), silenced = Set<String>()
-        for f in found {
+        for f in inMode {
             let p = f.path.lowercased()
-            if p.contains("deny") || p.contains("silenc") || p.contains("block") || p.contains("suppress") {
+            // Приложения-«включатели» фокуса и фильтры фокуса — не про уведомления.
+            if p.contains("trigger") || p.contains("filter") { continue }
+            if p.contains("deny") || p.contains("silenc") || p.contains("block") || p.contains("suppress") || p.contains("exclu") {
                 silenced.insert(f.bundle.lowercased())
-            } else if p.contains("allow") {
+            } else {
                 allowed.insert(f.bundle.lowercased())
             }
         }
+
         // Для диагностики: где лежат приложения и простые настройки фокуса (без людей и имён).
-        var details = found.prefix(12).map { "  " + ($0.path.isEmpty ? "·" : $0.path) + ": " + $0.bundle }
-        if let config = (modeRoot as? [String: Any])?["configuration"] as? [String: Any] {
+        var details = ["  файлы: " + (fileNotes.isEmpty ? "нет" : fileNotes.joined(separator: "; "))]
+        if let config {
             let scalars = config.compactMap { k, v -> String? in (v is NSNumber) ? "\(k)=\(v)" : nil }.sorted()
-            details.insert("  настройки: " + scalars.joined(separator: ", "), at: 0)
+            details.append("  настройки: " + scalars.joined(separator: ", "))
         }
-        if found.isEmpty { details.append("  приложений в настройках фокуса не найдено") }
+        for f in inMode.prefix(12) { details.append("  " + f.path + ": " + f.bundle) }
+        if inMode.isEmpty {
+            details.append("  приложений в настройках фокуса не найдено")
+            for (path, e) in elsewhere.sorted(by: { $0.value.count > $1.value.count }).prefix(8) {
+                details.append("  вне фокуса — " + path + ": \(e.example) (\(e.count))")
+            }
+        }
+        if !allowed.isEmpty { details.append("  пропускает: " + allowed.sorted().joined(separator: ", ")) }
+        if !silenced.isEmpty { details.append("  глушит: " + silenced.sorted().joined(separator: ", ")) }
         return Rules(allowed: allowed.isEmpty ? nil : allowed, silenced: silenced.isEmpty ? nil : silenced, details: details)
+    }
+
+    /// Обход JSON: каждый идентификатор приложения с путём и признаком «внутри включённого фокуса».
+    /// Внутри фокуса — словарь, где modeIdentifier (или вложенный mode.modeIdentifier) равен фокусу,
+    /// любое его значение равно фокусу, либо ключ словаря — сам фокус.
+    private static func scan(_ node: Any, path: [String], inMode: Bool, modeID: String,
+                             _ emit: (_ path: [String], _ bundle: String, _ inMode: Bool) -> Void) {
+        if let d = node as? [String: Any] {
+            let here = inMode || d.values.contains { v in
+                (v as? String) == modeID || ((v as? [String: Any])?["modeIdentifier"] as? String) == modeID
+            }
+            for (k, v) in d {
+                let child = here || k == modeID
+                if isBundleID(k, modeID) { emit(path + [k], k, child) }
+                if let str = v as? String, isBundleID(str, modeID) { emit(path + [k], str, child) }
+                scan(v, path: path + [k], inMode: child, modeID: modeID, emit)
+            }
+        } else if let a = node as? [Any] {
+            for v in a {
+                if let str = v as? String, isBundleID(str, modeID) { emit(path, str, inMode) }
+                scan(v, path: path, inMode: inMode, modeID: modeID, emit)
+            }
+        }
+    }
+
+    /// Похоже на идентификатор приложения: ru.keepcoder.Telegram, net.whatsapp.WhatsApp.
+    private static func isBundleID(_ s: String, _ modeID: String) -> Bool {
+        guard s.count >= 5, s.count <= 120, s != modeID,
+              !s.hasPrefix("com.apple.donotdisturb"), !s.hasPrefix("com.apple.focus") else { return false }
+        let parts = s.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 3, let first = parts.first, (2...6).contains(first.count),
+              first.allSatisfy({ $0.isLetter && $0.isLowercase && $0.isASCII }) else { return false }
+        return parts.allSatisfy { part in
+            !part.isEmpty && part.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
+        }
     }
 
     /// Узел настроек фокуса: словарь, внутри которого mode.modeIdentifier == modeID.
@@ -544,8 +745,12 @@ struct SystemNotificationsSettingsSection: View {
                     SettingsRow("Работает", subtitle: "Уведомления приходят в чёлку") {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(MH.green)
                     }
-                    SettingsRow("Фокус уважается",
-                                subtitle: "Пока включён фокус (на Mac или с iPhone), в чёлку приходят только уведомления, которые он пропустил") {
+                    if let speed = monitor.lastSpeed {
+                        SettingsRow("Скорость", subtitle: speedText(speed)) {
+                            Text(seconds(speed.total)).font(.system(size: 12, weight: .semibold)).foregroundStyle(MH.t2).monospacedDigit()
+                        }
+                    }
+                    SettingsRow("Фокус уважается", subtitle: MacFocus.settingsSummary()) {
                         Image(systemName: "moon.fill").foregroundStyle(MH.t2)
                     }
                     if !monitor.recentApps.isEmpty {
@@ -575,5 +780,15 @@ struct SystemNotificationsSettingsSection: View {
                 }
             }
         }
+    }
+
+    private func seconds(_ x: Double) -> String {
+        String(format: "%.1f с", x).replacingOccurrences(of: ".", with: ",")
+    }
+
+    private func speedText(_ s: SystemNotificationsMonitor.Speed) -> String {
+        let base = "Последнее уведомление появилось в чёлке через \(seconds(s.total)) после того, как его приняла macOS"
+        guard s.system >= 1 else { return base }
+        return base + ". Из них около \(seconds(s.system)) macOS не записывала его в базу — раньше этого хаб его не увидит"
     }
 }
