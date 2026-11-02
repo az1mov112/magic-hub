@@ -350,9 +350,7 @@ final class SystemNotificationsMonitor: ObservableObject {
         })
         let name = appURL.map { FileManager.default.displayName(atPath: $0.path).replacingOccurrences(of: ".app", with: "") } ?? bundle
         DispatchQueue.main.async {
-            AppModel.shared.post(note)
-            // В фокусе «Не беспокоить» macOS молчит — звук даёт хаб.
-            if Prefs.shared.notifSound { NSSound(named: NSSound.Name("Glass"))?.play() }
+            AppModel.shared.post(note)   // без звука: родной звук приложения играет сама macOS
             var apps = self.recentApps.filter { $0.bundle != bundle }
             apps.insert(RecentApp(bundle: bundle, name: name, icon: icon), at: 0)
             self.recentApps = Array(apps.prefix(8))
@@ -444,12 +442,9 @@ struct SystemNotificationsSettingsSection: View {
                                 subtitle: "Пока включён фокус (на Mac или с iPhone), в чёлку приходят только уведомления, которые он пропустил") {
                         Image(systemName: "moon.fill").foregroundStyle(MH.t2)
                     }
-                    SettingsToggleRow("Звук уведомления",
-                                      subtitle: "Если у приложения баннер выключен и macOS молчит — звук сыграет хаб",
-                                      isOn: $prefs.notifSound)
                     if !monitor.recentApps.isEmpty {
                         SettingsRow("Чтобы баннеры macOS не дублировали чёлку",
-                                    subtitle: "Отключите баннер у приложения (стиль «Нет») — его уведомления останутся в чёлке") { EmptyView() }
+                                    subtitle: "Отключите баннер у приложения (стиль «Нет») — его уведомления останутся в чёлке, а родной звук сыграет сама macOS, если «Звук для уведомлений» включён") { EmptyView() }
                         ForEach(monitor.recentApps) { app in
                             HStack(spacing: 10) {
                                 if let icon = app.icon {
