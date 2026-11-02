@@ -29,6 +29,9 @@ final class SystemNotificationsMonitor: ObservableObject {
     private var timer: DispatchSourceTimer?
     /// Слежение за журналом базы (-wal): macOS сама сообщает о новой записи — без задержки опроса.
     private var walSource: DispatchSourceFileSystemObject?
+    private var followUpScheduled = false
+    /// Задержки последних уведомлений: от доставки macOS до показа в чёлке (для диагностики).
+    private var latencies: [TimeInterval] = []
     private var cancellables = Set<AnyCancellable>()
     private var recent: [String: Date] = [:]
     private var icons: [String: NSImage] = [:]
@@ -61,8 +64,8 @@ final class SystemNotificationsMonitor: ObservableObject {
         }
         // Основной путь — событие записи в журнал базы; опрос — запасной (если событие не пришло).
         let t = DispatchSource.makeTimerSource(queue: queue)
-        let interval: Double = lite ? 5 : 3
-        t.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(lite ? 1000 : 500))
+        let interval: Double = lite ? 3 : 1
+        t.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(lite ? 600 : 150))
         t.setEventHandler { [weak self] in self?.poll() }
         t.resume()
         timer = t
@@ -116,7 +119,7 @@ final class SystemNotificationsMonitor: ObservableObject {
     }
 
     private func readNew() {
-        let sql = "SELECT r.rec_id, a.identifier, r.data FROM record r JOIN app a ON a.app_id = r.app_id WHERE r.rec_id > ? ORDER BY r.rec_id LIMIT 20"
+        let sql = "SELECT r.rec_id, a.identifier, r.data, r.delivered_date FROM record r JOIN app a ON a.app_id = r.app_id WHERE r.rec_id > ? ORDER BY r.rec_id LIMIT 20"
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -124,7 +127,7 @@ final class SystemNotificationsMonitor: ObservableObject {
             return
         }
         sqlite3_bind_int64(stmt, 1, lastRecID)
-        var rows: [(id: Int64, app: String, data: Data)] = []
+        var rows: [(id: Int64, app: String, data: Data, delivered: Double)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = sqlite3_column_int64(stmt, 0)
             let app = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
@@ -132,11 +135,19 @@ final class SystemNotificationsMonitor: ObservableObject {
             if let blob = sqlite3_column_blob(stmt, 2) {
                 data = Data(bytes: blob, count: Int(sqlite3_column_bytes(stmt, 2)))
             }
-            rows.append((id, app, data))
+            rows.append((id, app, data, sqlite3_column_double(stmt, 3)))
         }
         if case .working = status {} else { setStatus(.working) }
         for row in rows {
             lastRecID = max(lastRecID, row.id)
+            // delivered_date — секунды от 2001 года (время доставки уведомления macOS).
+            if row.delivered > 0 {
+                let lag = Date().timeIntervalSince(Date(timeIntervalSinceReferenceDate: row.delivered))
+                if lag >= 0 && lag < 600 {
+                    latencies.append(lag)
+                    if latencies.count > 8 { latencies.removeFirst() }
+                }
+            }
             present(row.app, row.data)
         }
     }
@@ -173,6 +184,15 @@ final class SystemNotificationsMonitor: ObservableObject {
                 self.walSource = nil
             }
             self.poll()
+            // Запись могла быть ещё не завершена — перечитать вдогонку.
+            if !self.followUpScheduled {
+                self.followUpScheduled = true
+                self.queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.poll() }
+                self.queue.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                    self?.followUpScheduled = false
+                    self?.poll()
+                }
+            }
         }
         src.setCancelHandler { close(fd) }
         src.resume()
@@ -234,6 +254,9 @@ final class SystemNotificationsMonitor: ObservableObject {
         // Три последние записи — только приложение и названия полей.
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
+        l.append("задержка последних (доставка macOS → чтение хабом, с): "
+                 + (latencies.isEmpty ? "нет данных" : latencies.map { String(format: "%.1f", $0) }.joined(separator: ", "))
+                 + ", слежение за журналом: " + (walSource == nil ? "нет" : "есть"))
         l.append("фокус сейчас: " + (MacFocus.isActive() ? "включён" : "выключен") + " (" + MacFocus.summary() + ")")
         if MacFocus.isActive() {
             l.append("настройки фокуса:")
