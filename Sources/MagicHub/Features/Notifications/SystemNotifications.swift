@@ -137,8 +137,6 @@ final class SystemNotificationsMonitor: ObservableObject {
         if case .working = status {} else { setStatus(.working) }
         for row in rows {
             lastRecID = max(lastRecID, row.id)
-            // Фокус (на Mac или с iPhone): приложения, которые он глушит, в хаб не попадают.
-            if MacFocus.allows(row.app) == false { continue }
             present(row.app, row.data)
         }
     }
@@ -309,6 +307,12 @@ final class SystemNotificationsMonitor: ObservableObject {
         guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return }
         let req = plist["req"] as? [String: Any] ?? [:]
         let bundle = (plist["app"] as? String) ?? identifier
+        // Фокус (на Mac или с iPhone): приложения, которые он глушит, в хаб не попадают —
+        // кроме неотложных уведомлений (уровень «time sensitive» и выше), как и у самой macOS.
+        if MacFocus.allows(bundle) == false {
+            let level = (plist["intl"] as? NSNumber)?.intValue ?? 1
+            if level < 2 { return }
+        }
         guard bundle.caseInsensitiveCompare(ownBundle) != .orderedSame else { return }
         func field(_ keys: String...) -> String {
             for k in keys {
