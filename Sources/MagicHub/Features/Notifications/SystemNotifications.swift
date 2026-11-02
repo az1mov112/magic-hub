@@ -14,6 +14,15 @@ final class SystemNotificationsMonitor: ObservableObject {
     enum Status: Equatable { case off, noAccess, notFound, working, failed(String) }
     @Published private(set) var status: Status = .off
 
+    /// Приложения, которые недавно присылали уведомления, — для кнопок «Отключить баннер».
+    struct RecentApp: Identifiable {
+        let bundle: String
+        let name: String
+        let icon: NSImage?
+        var id: String { bundle }
+    }
+    @Published private(set) var recentApps: [RecentApp] = []
+
     private let queue = DispatchQueue(label: "app.magichub.system-notifications", qos: .utility)
     private var db: OpaquePointer?
     private var lastRecID: Int64 = -1
@@ -323,7 +332,15 @@ final class SystemNotificationsMonitor: ObservableObject {
                 NSWorkspace.shared.openApplication(at: appURL, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
             }
         })
-        DispatchQueue.main.async { AppModel.shared.post(note) }
+        let name = appURL.map { FileManager.default.displayName(atPath: $0.path).replacingOccurrences(of: ".app", with: "") } ?? bundle
+        DispatchQueue.main.async {
+            AppModel.shared.post(note)
+            // В фокусе «Не беспокоить» macOS молчит — звук даёт хаб.
+            if Prefs.shared.notifSound { NSSound(named: NSSound.Name("Glass"))?.play() }
+            var apps = self.recentApps.filter { $0.bundle != bundle }
+            apps.insert(RecentApp(bundle: bundle, name: name, icon: icon), at: 0)
+            self.recentApps = Array(apps.prefix(8))
+        }
         if Prefs.shared.hideSystemBanners {
             // Баннер macOS появляется чуть позже записи в базу — закрыть его, как только он есть.
             for delay in [0.15, 0.5, 1.2] {
@@ -363,11 +380,38 @@ struct SystemNotificationsSettingsSection: View {
                 case .failed(let message):
                     SettingsButtonRow("Не удалось прочитать уведомления", subtitle: message, buttonTitle: "Повторить") { monitor.retry() }
                 case .working:
-                    SettingsRow("Работает", subtitle: "Надёжный способ убрать дубль: Системные настройки → Уведомления → приложение → стиль «Нет». Уведомления этого приложения всё равно придут в чёлку") {
+                    SettingsRow("Работает", subtitle: "Уведомления приходят в чёлку") {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(MH.green)
                     }
+                    SettingsButtonRow("Без баннеров macOS совсем",
+                                      subtitle: "Включите фокус «Не беспокоить» (Пункт управления → Фокусирование) до отключения и выключите «Общий доступ между устройствами». Баннеров не будет ни от одного приложения, а уведомления продолжат приходить в чёлку",
+                                      buttonTitle: "Настройки фокуса") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.Focus-Settings.extension") { NSWorkspace.shared.open(url) }
+                    }
+                    SettingsToggleRow("Звук уведомления",
+                                      subtitle: "В «Не беспокоить» macOS молчит — звук сыграет хаб",
+                                      isOn: $prefs.notifSound)
+                    if !monitor.recentApps.isEmpty {
+                        SettingsRow("Или отключить баннер у отдельных приложений",
+                                    subtitle: "Стиль «Нет» — баннера не будет, уведомления останутся в чёлке") { EmptyView() }
+                        ForEach(monitor.recentApps) { app in
+                            HStack(spacing: 10) {
+                                if let icon = app.icon {
+                                    Image(nsImage: icon).resizable().frame(width: 20, height: 20)
+                                }
+                                Text(app.name).font(.system(size: 12)).foregroundStyle(MH.t1)
+                                Spacer()
+                                Button("Отключить баннер") {
+                                    let link = "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=" + app.bundle
+                                    if let url = URL(string: link) { NSWorkspace.shared.open(url) }
+                                }
+                                .buttonStyle(MHButtonStyle())
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
                     SettingsToggleRow("Закрывать системные баннеры (эксперимент)",
-                                      subtitle: "Баннер macOS закрывается сразу, как уведомление пришло в чёлку; может мелькнуть. Уведомление при этом уходит и из Центра уведомлений. Нужен «Универсальный доступ»",
+                                      subtitle: "Баннер закрывается сразу после появления, но может мелькнуть, и уведомление уходит из Центра уведомлений",
                                       isOn: $prefs.hideSystemBanners)
                 case .off:
                     EmptyView()
