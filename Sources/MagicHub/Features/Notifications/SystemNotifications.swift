@@ -149,7 +149,7 @@ final class SystemNotificationsMonitor: ObservableObject {
         if case .working = status {} else { setStatus(.working) }
         // Фокус (на Mac или с iPhone): уведомления, которые он заглушил, в хаб не попадают —
         // показываем только те, что macOS пропустила сквозь фокус.
-        let focus = !rows.isEmpty && FocusState.isActive()
+        let focus = !rows.isEmpty && MacFocus.isActive()
         for row in rows {
             lastRecID = max(lastRecID, row.id)
             if focus && !row.presented { continue }
@@ -251,7 +251,7 @@ final class SystemNotificationsMonitor: ObservableObject {
         // Три последние записи — только приложение и названия полей.
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        l.append("фокус сейчас: " + (FocusState.isActive() ? "включён" : "выключен") + " (" + FocusState.summary() + ")")
+        l.append("фокус сейчас: " + (MacFocus.isActive() ? "включён" : "выключен") + " (" + MacFocus.summary() + ")")
         if sqlite3_prepare_v2(handle, "SELECT r.rec_id, a.identifier, r.data, r.presented, r.style FROM record r JOIN app a ON a.app_id = r.app_id ORDER BY r.rec_id DESC LIMIT 5", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let id = sqlite3_column_int64(stmt, 0)
@@ -367,7 +367,7 @@ final class SystemNotificationsMonitor: ObservableObject {
 /// Включён ли фокус — на этом Mac или пришедший с iPhone («Общий доступ между устройствами»).
 /// donotdisturbd записывает активные фокусы в ~/Library/DoNotDisturb/DB/Assertions.json
 /// (читается с «Полным доступом к диску»).
-enum FocusState {
+enum MacFocus {
     private static let lock = NSLock()
     private static var cache: (date: Date, active: Bool, summary: String)?
 
