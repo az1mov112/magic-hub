@@ -115,27 +115,16 @@ final class SystemNotificationsMonitor: ObservableObject {
         return sqlite3_column_int64(stmt, 0)
     }
 
-    /// Есть ли в базе поле presented (показан ли баннер). nil — ещё не проверяли.
-    private var hasPresentedColumn: Bool?
-
     private func readNew() {
-        let withPresented = hasPresentedColumn ?? true
-        let sql = "SELECT r.rec_id, a.identifier, r.data" + (withPresented ? ", r.presented" : "")
-            + " FROM record r JOIN app a ON a.app_id = r.app_id WHERE r.rec_id > ? ORDER BY r.rec_id LIMIT 20"
+        let sql = "SELECT r.rec_id, a.identifier, r.data FROM record r JOIN app a ON a.app_id = r.app_id WHERE r.rec_id > ? ORDER BY r.rec_id LIMIT 20"
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            if withPresented && hasPresentedColumn == nil {
-                hasPresentedColumn = false   // старая схема без presented — читать без него
-                readNew()
-            } else {
-                failQuery()
-            }
+            failQuery()
             return
         }
-        hasPresentedColumn = withPresented
         sqlite3_bind_int64(stmt, 1, lastRecID)
-        var rows: [(id: Int64, app: String, data: Data, presented: Bool)] = []
+        var rows: [(id: Int64, app: String, data: Data)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = sqlite3_column_int64(stmt, 0)
             let app = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
@@ -143,16 +132,13 @@ final class SystemNotificationsMonitor: ObservableObject {
             if let blob = sqlite3_column_blob(stmt, 2) {
                 data = Data(bytes: blob, count: Int(sqlite3_column_bytes(stmt, 2)))
             }
-            let presented = withPresented ? sqlite3_column_int(stmt, 3) != 0 : true
-            rows.append((id, app, data, presented))
+            rows.append((id, app, data))
         }
         if case .working = status {} else { setStatus(.working) }
-        // Фокус (на Mac или с iPhone): уведомления, которые он заглушил, в хаб не попадают —
-        // показываем только те, что macOS пропустила сквозь фокус.
-        let focus = !rows.isEmpty && MacFocus.isActive()
         for row in rows {
             lastRecID = max(lastRecID, row.id)
-            if focus && !row.presented { continue }
+            // Фокус (на Mac или с iPhone): приложения, которые он глушит, в хаб не попадают.
+            if MacFocus.allows(row.app) == false { continue }
             present(row.app, row.data)
         }
     }
@@ -169,7 +155,6 @@ final class SystemNotificationsMonitor: ObservableObject {
     }
 
     private func closeDB() {
-        hasPresentedColumn = nil
         walSource?.cancel()
         walSource = nil
         if let db { sqlite3_close(db) }
@@ -252,11 +237,22 @@ final class SystemNotificationsMonitor: ObservableObject {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         l.append("фокус сейчас: " + (MacFocus.isActive() ? "включён" : "выключен") + " (" + MacFocus.summary() + ")")
+        if MacFocus.isActive() {
+            l.append("настройки фокуса:")
+            l += MacFocus.rulesDetails()
+        }
         if sqlite3_prepare_v2(handle, "SELECT r.rec_id, a.identifier, r.data, r.presented, r.style FROM record r JOIN app a ON a.app_id = r.app_id ORDER BY r.rec_id DESC LIMIT 5", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let id = sqlite3_column_int64(stmt, 0)
                 let shown = "presented=\(sqlite3_column_int(stmt, 3)) style=\(sqlite3_column_int(stmt, 4))"
-                let app = (sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "?") + " " + shown
+                let bundle = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "?"
+                let verdict: String
+                switch MacFocus.allows(bundle) {
+                case .some(true): verdict = "показать"
+                case .some(false): verdict = "заглушено фокусом"
+                case .none: verdict = "фокус не разобран — показать"
+                }
+                let app = bundle + " " + shown + " → " + verdict
                 var keys = "?"
                 if let blob = sqlite3_column_blob(stmt, 2) {
                     let data = Data(bytes: blob, count: Int(sqlite3_column_bytes(stmt, 2)))
@@ -368,40 +364,122 @@ final class SystemNotificationsMonitor: ObservableObject {
 /// donotdisturbd записывает активные фокусы в ~/Library/DoNotDisturb/DB/Assertions.json
 /// (читается с «Полным доступом к диску»).
 enum MacFocus {
+    /// Что фокус делает с приложениями: список разрешённых или заглушённых (bundle id в нижнем регистре).
+    struct Rules {
+        var allowed: Set<String>?
+        var silenced: Set<String>?
+        var details: [String]
+    }
+
     private static let lock = NSLock()
-    private static var cache: (date: Date, active: Bool, summary: String)?
+    private static var cache: (date: Date, modes: [String], summary: String, rules: Rules?)?
+    private static let dir = AppPaths.home.appendingPathComponent("Library/DoNotDisturb/DB")
 
-    static func isActive() -> Bool { read().active }
+    static func isActive() -> Bool { !read().modes.isEmpty }
     static func summary() -> String { read().summary }
+    static func rulesDetails() -> [String] { read().rules?.details ?? ["настройки фокуса не прочитаны"] }
 
-    private static func read() -> (active: Bool, summary: String) {
+    /// Пропускает ли включённый фокус уведомления приложения. nil — неизвестно (настройки фокуса не разобраны):
+    /// тогда уведомление показываем, чтобы не терять его.
+    static func allows(_ bundle: String) -> Bool? {
+        let s = read()
+        guard !s.modes.isEmpty else { return true }
+        guard let r = s.rules else { return nil }
+        let b = bundle.lowercased()
+        if let allowed = r.allowed { return allowed.contains(b) }
+        if let silenced = r.silenced { return !silenced.contains(b) }
+        return nil
+    }
+
+    private static func read() -> (modes: [String], summary: String, rules: Rules?) {
         lock.lock(); defer { lock.unlock() }
-        if let c = cache, Date().timeIntervalSince(c.date) < 2 { return (c.active, c.summary) }
-        let url = AppPaths.home.appendingPathComponent("Library/DoNotDisturb/DB/Assertions.json")
-        var active = false
+        if let c = cache, Date().timeIntervalSince(c.date) < 2 { return (c.modes, c.summary, c.rules) }
+        var modes: [String] = []
         var summary = "файл фокуса не читается"
-        if let data = try? Data(contentsOf: url),
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("Assertions.json")),
            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            let stores = root["data"] as? [[String: Any]] ?? []
-            var modes: [String] = []
-            for store in stores {
+            for store in root["data"] as? [[String: Any]] ?? [] {
                 let assertions = store["storeAssertionRecords"] as? [[String: Any]] ?? []
                 // Завершённые фокусы перечислены в storeInvalidationRecords.
                 let invalidated = Set((store["storeInvalidationRecords"] as? [[String: Any]] ?? []).compactMap { rec -> String? in
                     (rec["invalidationAssertion"] as? [String: Any])?["assertionUUID"] as? String ?? rec["assertionUUID"] as? String
                 })
                 for a in assertions where !invalidated.contains(a["assertionUUID"] as? String ?? "") {
-                    active = true
-                    let details = a["assertionDetails"] as? [String: Any]
-                    modes.append((details?["assertionDetailsModeIdentifier"] as? String ?? "?")
-                        .replacingOccurrences(of: "com.apple.donotdisturb.mode.", with: "")
-                        .replacingOccurrences(of: "com.apple.focus.", with: ""))
+                    if let id = (a["assertionDetails"] as? [String: Any])?["assertionDetailsModeIdentifier"] as? String {
+                        modes.append(id)
+                    }
                 }
             }
-            summary = modes.isEmpty ? "активных нет" : "активные: " + modes.joined(separator: ", ")
+            summary = modes.isEmpty ? "активных нет" : "активные: " + modes.map(short).joined(separator: ", ")
         }
-        cache = (Date(), active, summary)
-        return (active, summary)
+        let rules = modes.first.flatMap(rules(for:))
+        cache = (Date(), modes, summary, rules)
+        return (modes, summary, rules)
+    }
+
+    private static func short(_ id: String) -> String {
+        id.replacingOccurrences(of: "com.apple.donotdisturb.mode.", with: "").replacingOccurrences(of: "com.apple.focus.", with: "")
+    }
+
+    /// Настройки фокуса из ModeConfigurations.json: какие приложения он пропускает или глушит.
+    /// Формат Apple не документирован, поэтому ищем по смыслу: идентификаторы приложений под ключами
+    /// со словами allow / deny / silence.
+    private static func rules(for modeID: String) -> Rules? {
+        guard let data = try? Data(contentsOf: dir.appendingPathComponent("ModeConfigurations.json")),
+              let root = try? JSONSerialization.jsonObject(with: data),
+              let modeRoot = find(modeID, in: root, parent: nil) else { return nil }
+
+        var found: [(path: String, bundle: String)] = []
+        func walk(_ node: Any, _ path: [String]) {
+            if let d = node as? [String: Any] {
+                for (k, v) in d {
+                    let key = k.lowercased()
+                    if let str = v as? String, str.contains("."), !str.contains(" "),
+                       key.contains("bundle") || key.contains("applicationidentifier") {
+                        found.append((path.joined(separator: "."), str))
+                    }
+                    walk(v, path + [k])
+                }
+            } else if let a = node as? [Any] {
+                for v in a {
+                    if let str = v as? String, str.contains("."), !str.contains(" "), !str.contains("@"),
+                       let last = path.last?.lowercased(), last.contains("application") || last.contains("bundle") {
+                        found.append((path.joined(separator: "."), str))
+                    }
+                    walk(v, path)
+                }
+            }
+        }
+        walk(modeRoot, [])
+
+        var allowed = Set<String>(), silenced = Set<String>()
+        for f in found {
+            let p = f.path.lowercased()
+            if p.contains("deny") || p.contains("silenc") || p.contains("block") || p.contains("suppress") {
+                silenced.insert(f.bundle.lowercased())
+            } else if p.contains("allow") {
+                allowed.insert(f.bundle.lowercased())
+            }
+        }
+        // Для диагностики: где лежат приложения и простые настройки фокуса (без людей и имён).
+        var details = found.prefix(12).map { "  " + ($0.path.isEmpty ? "·" : $0.path) + ": " + $0.bundle }
+        if let config = (modeRoot as? [String: Any])?["configuration"] as? [String: Any] {
+            let scalars = config.compactMap { k, v -> String? in (v is NSNumber) ? "\(k)=\(v)" : nil }.sorted()
+            details.insert("  настройки: " + scalars.joined(separator: ", "), at: 0)
+        }
+        if found.isEmpty { details.append("  приложений в настройках фокуса не найдено") }
+        return Rules(allowed: allowed.isEmpty ? nil : allowed, silenced: silenced.isEmpty ? nil : silenced, details: details)
+    }
+
+    /// Узел настроек фокуса: словарь, внутри которого mode.modeIdentifier == modeID.
+    private static func find(_ modeID: String, in node: Any, parent: Any?) -> Any? {
+        if let d = node as? [String: Any] {
+            if (d["modeIdentifier"] as? String) == modeID { return parent ?? d }
+            for v in d.values { if let r = find(modeID, in: v, parent: d) { return r } }
+        } else if let a = node as? [Any] {
+            for v in a { if let r = find(modeID, in: v, parent: parent) { return r } }
+        }
+        return nil
     }
 }
 
