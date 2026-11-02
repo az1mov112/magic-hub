@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Combine
 import SQLite3
+import ApplicationServices
 
 /// Уведомления macOS → в чёлку со значком приложения.
 /// Перехватить чужие уведомления macOS не даёт, но каждое из них записывается в базу Центра
@@ -17,6 +18,8 @@ final class SystemNotificationsMonitor: ObservableObject {
     private var db: OpaquePointer?
     private var lastRecID: Int64 = -1
     private var timer: DispatchSourceTimer?
+    /// Слежение за журналом базы (-wal): macOS сама сообщает о новой записи — без задержки опроса.
+    private var walSource: DispatchSourceFileSystemObject?
     private var cancellables = Set<AnyCancellable>()
     private var recent: [String: Date] = [:]
     private var icons: [String: NSImage] = [:]
@@ -47,9 +50,10 @@ final class SystemNotificationsMonitor: ObservableObject {
             status = .off
             return
         }
+        // Основной путь — событие записи в журнал базы; опрос — запасной (если событие не пришло).
         let t = DispatchSource.makeTimerSource(queue: queue)
-        let interval: Double = lite ? 3 : 1.5
-        t.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(lite ? 800 : 300))
+        let interval: Double = lite ? 5 : 3
+        t.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(lite ? 1000 : 500))
         t.setEventHandler { [weak self] in self?.poll() }
         t.resume()
         timer = t
@@ -80,6 +84,7 @@ final class SystemNotificationsMonitor: ObservableObject {
             sqlite3_busy_timeout(handle, 250)
             db = handle
         }
+        watchJournal(url)
         // Первый запуск: старые уведомления не показываем, начинаем с самой свежей записи.
         if lastRecID < 0 {
             guard let maxID = queryMaxID() else { return }
@@ -142,8 +147,30 @@ final class SystemNotificationsMonitor: ObservableObject {
     }
 
     private func closeDB() {
+        walSource?.cancel()
+        walSource = nil
         if let db { sqlite3_close(db) }
         db = nil
+    }
+
+    /// usernoted дописывает новое уведомление в db-wal — читаем сразу по событию записи.
+    private func watchJournal(_ dbURL: URL) {
+        guard walSource == nil else { return }
+        let fd = open(dbURL.path + "-wal", O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename], queue: queue)
+        src.setEventHandler { [weak self] in
+            guard let self else { return }
+            if !src.data.intersection([.delete, .rename]).isEmpty {
+                // Журнал пересоздан — следить за новым файлом со следующего опроса.
+                self.walSource?.cancel()
+                self.walSource = nil
+            }
+            self.poll()
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        walSource = src
     }
 
     private func setStatus(_ s: Status) {
@@ -223,6 +250,38 @@ final class SystemNotificationsMonitor: ObservableObject {
         return l.joined(separator: "\n")
     }
 
+    // MARK: Системные баннеры (экспериментально)
+
+    /// Закрыть баннеры macOS через «Универсальный доступ»: у баннера есть действие «Закрыть».
+    /// Открытую панель Центра уведомлений (высокое окно) не трогаем.
+    static func closeSystemBanners() {
+        guard AXIsProcessTrusted(),
+              let nc = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.notificationcenterui").first else { return }
+        let app = AXUIElementCreateApplication(nc.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return }
+        for w in windows {
+            if let size = WindowLayoutManager.size(of: w), size.height > 420 { continue }
+            closeIn(w, depth: 0)
+        }
+    }
+
+    private static func closeIn(_ el: AXUIElement, depth: Int) {
+        guard depth < 10 else { return }
+        var names: CFArray?
+        if AXUIElementCopyActionNames(el, &names) == .success, let list = names as? [String],
+           let close = list.first(where: { n in n.contains("Close") || n.contains("Закрыть") }) {
+            AXUIElementPerformAction(el, close as CFString)
+            return
+        }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &value) == .success,
+              let children = value as? [AXUIElement] else { return }
+        for c in children { closeIn(c, depth: depth + 1) }
+    }
+
     // MARK: Показ
 
     private func present(_ identifier: String, _ data: Data) {
@@ -265,6 +324,12 @@ final class SystemNotificationsMonitor: ObservableObject {
             }
         })
         DispatchQueue.main.async { AppModel.shared.post(note) }
+        if Prefs.shared.hideSystemBanners {
+            // Баннер macOS появляется чуть позже записи в базу — закрыть его, как только он есть.
+            for delay in [0.15, 0.5, 1.2] {
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { Self.closeSystemBanners() }
+            }
+        }
     }
 }
 
@@ -298,9 +363,12 @@ struct SystemNotificationsSettingsSection: View {
                 case .failed(let message):
                     SettingsButtonRow("Не удалось прочитать уведомления", subtitle: message, buttonTitle: "Повторить") { monitor.retry() }
                 case .working:
-                    SettingsRow("Работает", subtitle: "Чтобы системные баннеры не дублировались: Системные настройки → Уведомления → приложение → стиль «Нет» (уведомления остаются в Центре уведомлений и приходят в чёлку) или включите фокус «Не беспокоить»") {
+                    SettingsRow("Работает", subtitle: "Надёжный способ убрать дубль: Системные настройки → Уведомления → приложение → стиль «Нет». Уведомления этого приложения всё равно придут в чёлку") {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(MH.green)
                     }
+                    SettingsToggleRow("Закрывать системные баннеры (эксперимент)",
+                                      subtitle: "Баннер macOS закрывается сразу, как уведомление пришло в чёлку; может мелькнуть. Уведомление при этом уходит и из Центра уведомлений. Нужен «Универсальный доступ»",
+                                      isOn: $prefs.hideSystemBanners)
                 case .off:
                     EmptyView()
                 }

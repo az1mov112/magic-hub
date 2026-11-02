@@ -21,6 +21,8 @@ final class Prefs: ObservableObject {
 
     /// Уведомления macOS из Центра уведомлений — в чёлке.
     @Published var systemNotifications: Bool = Prefs.bool("systemNotifications", true) { didSet { Prefs.d.set(systemNotifications, forKey: "systemNotifications") } }
+    /// Закрывать системные баннеры через «Универсальный доступ» (эксперимент).
+    @Published var hideSystemBanners: Bool = Prefs.bool("hideSystemBanners", false) { didSet { Prefs.d.set(hideSystemBanners, forKey: "hideSystemBanners") } }
     /// Сколько секунд висит уведомление в чёлке.
     @Published var notifSeconds: Double = Prefs.double("notifSeconds", 6) { didSet { Prefs.d.set(notifSeconds, forKey: "notifSeconds") } }
 
