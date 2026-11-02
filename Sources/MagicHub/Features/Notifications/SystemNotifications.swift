@@ -64,8 +64,9 @@ final class SystemNotificationsMonitor: ObservableObject {
         }
         // Основной путь — событие записи в журнал базы; опрос — запасной (если событие не пришло).
         let t = DispatchSource.makeTimerSource(queue: queue)
-        let interval: Double = lite ? 3 : 1
-        t.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(lite ? 600 : 150))
+        // Проверка — один короткий запрос к открытой базе, поэтому почти непрерывно: 4 раза в секунду.
+        let interval: Double = lite ? 1 : 0.25
+        t.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(lite ? 200 : 40))
         t.setEventHandler { [weak self] in self?.poll() }
         t.resume()
         timer = t
