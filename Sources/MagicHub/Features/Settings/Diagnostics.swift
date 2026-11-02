@@ -18,8 +18,9 @@ enum Diagnostics {
             let cpu = Shell.run("/bin/ps", ["-o", "pcpu=,rss=", "-p", "\(pid)"]).out.trimmingCharacters(in: .whitespacesAndNewlines)
             let load = "нагрузка Magic Hub (CPU %, память КБ): \(cpu), экономный режим: \(Prefs.shared.lite ? "да" : "нет")"
             let jarvis = Prefs.shared.jarvisEnabled ? JarvisMonitor.shared.diagnostics() : "[Джарвис]\nмониторинг выключен"
+            let notifications = SystemNotificationsMonitor.shared.diagnostics()
             DispatchQueue.main.async {
-                Clipboard.copy([header + "\n" + load, jarvis, notion].joined(separator: "\n\n"))
+                Clipboard.copy([header + "\n" + load, jarvis, notion, notifications].joined(separator: "\n\n"))
                 AppModel.shared.flash("Диагностика скопирована — вставьте её в чат")
             }
         }

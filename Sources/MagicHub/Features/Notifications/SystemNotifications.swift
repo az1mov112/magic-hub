@@ -150,6 +150,79 @@ final class SystemNotificationsMonitor: ObservableObject {
         DispatchQueue.main.async { if self.status != s { self.status = s } }
     }
 
+    // MARK: Диагностика
+
+    /// Отчёт без текста уведомлений: где база, есть ли доступ, какие поля в записях. Вызывать не из queue.
+    func diagnostics() -> String {
+        queue.sync { diagnosticsText() }
+    }
+
+    private func diagnosticsText() -> String {
+        var l = ["[Уведомления Mac]"]
+        l.append("включено: " + (Prefs.shared.systemNotifications ? "да" : "нет") + ", статус: \(status)")
+        let home = AppPaths.home.path
+        let groupPath = AppPaths.home.appendingPathComponent("Library/Group Containers/group.com.apple.usernoted/db2/db").path
+        l.append("база usernoted: " + (FileManager.default.fileExists(atPath: groupPath) ? "есть" : "нет")
+                 + ", читается: " + (FileManager.default.isReadableFile(atPath: groupPath) ? "да" : "нет"))
+        guard let url = Self.databaseURL else {
+            l.append("база не найдена")
+            return l.joined(separator: "\n")
+        }
+        l.append("путь: " + url.path.replacingOccurrences(of: home, with: "~"))
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
+            l.append("не открывается: " + String(cString: sqlite3_errmsg(handle)))
+            sqlite3_close(handle)
+            return l.joined(separator: "\n")
+        }
+        defer { sqlite3_close(handle) }
+        func rows(_ sql: String, _ cols: Int32) -> [[String]]? {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK else {
+                l.append("запрос «\(sql.prefix(40))…»: " + String(cString: sqlite3_errmsg(handle)))
+                return nil
+            }
+            var out: [[String]] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                out.append((0..<cols).map { i in sqlite3_column_text(stmt, i).map { String(cString: $0) } ?? "" })
+            }
+            return out
+        }
+        if let tables = rows("SELECT name FROM sqlite_master WHERE type='table'", 1) {
+            l.append("таблицы: " + tables.map { $0[0] }.joined(separator: ", "))
+        }
+        if let cols = rows("PRAGMA table_info(record)", 2) {
+            l.append("поля record: " + cols.map { $0[1] }.joined(separator: ", "))
+        }
+        if let stat = rows("SELECT COUNT(*), MAX(rec_id) FROM record", 2), let s = stat.first {
+            l.append("записей: \(s[0]), последняя: \(s[1]), Magic Hub читает после: \(lastRecID)")
+        }
+        // Три последние записи — только приложение и названия полей.
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        if sqlite3_prepare_v2(handle, "SELECT r.rec_id, a.identifier, r.data FROM record r JOIN app a ON a.app_id = r.app_id ORDER BY r.rec_id DESC LIMIT 3", -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let id = sqlite3_column_int64(stmt, 0)
+                let app = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "?"
+                var keys = "?"
+                if let blob = sqlite3_column_blob(stmt, 2) {
+                    let data = Data(bytes: blob, count: Int(sqlite3_column_bytes(stmt, 2)))
+                    if let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] {
+                        let req = (plist["req"] as? [String: Any]).map { " req: " + $0.keys.sorted().joined(separator: ",") } ?? ""
+                        keys = plist.keys.sorted().joined(separator: ",") + req
+                    } else {
+                        keys = "не plist (\(data.count) байт)"
+                    }
+                }
+                l.append("  #\(id) \(app): \(keys)")
+            }
+        } else {
+            l.append("последние записи: " + String(cString: sqlite3_errmsg(handle)))
+        }
+        return l.joined(separator: "\n")
+    }
+
     // MARK: Показ
 
     private func present(_ identifier: String, _ data: Data) {
@@ -157,9 +230,15 @@ final class SystemNotificationsMonitor: ObservableObject {
         let req = plist["req"] as? [String: Any] ?? [:]
         let bundle = (plist["app"] as? String) ?? identifier
         guard bundle.caseInsensitiveCompare(ownBundle) != .orderedSame else { return }
-        let title = (req["titl"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let sub = (req["subt"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = (req["body"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        func field(_ keys: String...) -> String {
+            for k in keys {
+                if let v = (req[k] ?? plist[k]) as? String { return v.trimmingCharacters(in: .whitespacesAndNewlines) }
+            }
+            return ""
+        }
+        let title = field("titl", "title")
+        let sub = field("subt", "subtitle")
+        let body = field("body", "message")
         let main = !title.isEmpty ? title : (!sub.isEmpty ? sub : body)
         guard !main.isEmpty else { return }
         let second = [sub, body].filter { !$0.isEmpty && $0 != main }.joined(separator: " · ")
