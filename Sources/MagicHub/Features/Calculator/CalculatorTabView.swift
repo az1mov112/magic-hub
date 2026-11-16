@@ -119,10 +119,22 @@ final class CalcEngine: ObservableObject {
         }
     }
 
+    /// ⌫: стереть последнюю цифру. Сразу после «+ − × ÷» — отменить действие, после ошибки — сбросить.
     func backspace() {
-        guard !isError, !fresh else { return }
+        if isError || display.contains("e") {
+            clear()
+            return
+        }
+        if fresh, pendingOp != nil, let acc = accumulator {
+            display = CalcEngine.format(acc)
+            pendingOp = nil
+            accumulator = nil
+            fresh = false
+            return
+        }
+        fresh = false
         display.removeLast()
-        if display.isEmpty || display == "-" { display = "0" }
+        if display.isEmpty || display == "-" || display == "-0" { display = "0" }
     }
 
     func pick(_ entry: Entry) {
@@ -283,6 +295,8 @@ struct CalculatorTabView: View {
         }
         .onCopyCommand { copyResult() }
         .onPasteCommand(of: [UTType.plainText, UTType.utf8PlainText]) { _ in paste() }
+        // ⌫ и ⌦ SwiftUI на Mac отдаёт командой «Удалить», а не обычным нажатием клавиши.
+        .onDeleteCommand { calc.backspace() }
         .onAppear { focused = true }
         .panelMeta("")
     }
@@ -473,7 +487,8 @@ struct CalculatorTabView: View {
             calc.press("=")
             return true
         }
-        if press.key == .delete || press.key == .deleteForward {
+        if press.key == .delete || press.key == .deleteForward
+            || press.characters == "\u{7F}" || press.characters == "\u{08}" {
             calc.backspace()
             return true
         }
