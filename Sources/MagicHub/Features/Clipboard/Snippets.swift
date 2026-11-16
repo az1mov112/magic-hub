@@ -110,10 +110,7 @@ struct SnippetsTabView: View {
                 .padding(.horizontal, 10)
                 .frame(height: 32)
                 .background(RoundedRectangle(cornerRadius: 9).fill(MH.card))
-            TextEditor(text: Binding(get: { draft?.body ?? "" }, set: { draft?.body = $0 }))
-                .font(.system(size: 13))
-                .scrollContentBackground(.hidden)
-                .padding(8)
+            MHTextArea(text: Binding(get: { draft?.body ?? "" }, set: { draft?.body = $0 }), fontSize: 13, placeholder: "Текст заготовки", inset: 10)
                 .background(RoundedRectangle(cornerRadius: 9).fill(MH.card))
                 .frame(maxHeight: .infinity)
             HStack(spacing: 8) {

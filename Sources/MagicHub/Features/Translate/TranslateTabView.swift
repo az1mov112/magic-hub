@@ -115,21 +115,8 @@ struct TranslateTabView: View {
 
     private var textBody: some View {
         HStack(spacing: 10) {
-            ZStack(alignment: .topLeading) {
-                TextEditor(text: $model.input)
-                    .font(.system(size: 15))
-                    .scrollContentBackground(.hidden)
-                    .padding(8)
-                if model.input.isEmpty {
-                    Text("Введите или вставьте текст")
-                        .font(.system(size: 15))
-                        .foregroundStyle(MH.t3)
-                        .padding(.horizontal, 13)
-                        .padding(.vertical, 8)
-                        .allowsHitTesting(false)
-                }
-            }
-            .background(RoundedRectangle(cornerRadius: 12).fill(MH.card))
+            MHTextArea(text: $model.input, fontSize: 15, placeholder: "Введите или вставьте текст", inset: 12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(MH.card))
 
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {

@@ -107,10 +107,7 @@ struct NotesTabView: View {
             .frame(width: 200)
 
             if let id = store.selectedID, store.notes.contains(where: { $0.id == id }) {
-                TextEditor(text: Binding(get: { store.text(for: id) }, set: { store.update(id, text: $0) }))
-                    .font(.system(size: 14))
-                    .scrollContentBackground(.hidden)
-                    .padding(10)
+                MHTextArea(text: Binding(get: { store.text(for: id) }, set: { store.update(id, text: $0) }), fontSize: 14, inset: 14)
                     .background(RoundedRectangle(cornerRadius: 12).fill(MH.card))
                     .id(id)
             } else {

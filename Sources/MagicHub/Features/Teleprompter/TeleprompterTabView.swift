@@ -140,23 +140,8 @@ struct TeleprompterTabView: View {
 
     private var editor: some View {
         VStack(spacing: 8) {
-            ZStack(alignment: .topLeading) {
-                TextEditor(text: $prefs.tpText)
-                    .font(.system(size: 14))
-                    .foregroundStyle(MH.t1)
-                    .scrollContentBackground(.hidden)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 8)
-                if prefs.tpText.isEmpty {
-                    Text("Вставьте сюда сценарий")
-                        .font(.system(size: 14))
-                        .foregroundStyle(MH.t3)
-                        .padding(.horizontal, 13)
-                        .padding(.vertical, 8)
-                        .allowsHitTesting(false)
-                }
-            }
-            .background(RoundedRectangle(cornerRadius: 12).fill(MH.card))
+            MHTextArea(text: $prefs.tpText, fontSize: 14, placeholder: "Вставьте сюда сценарий", inset: 12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(MH.card))
 
             HStack {
                 Text("\(prefs.tpText.count) знаков")

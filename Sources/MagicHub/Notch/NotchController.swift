@@ -165,6 +165,12 @@ final class NotchPanel: NSPanel {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    /// ⌘V, ⌘C и прочие сочетания правки: меню «Правка» у приложения нет, доставляем сами.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if super.performKeyEquivalent(with: event) { return true }
+        return EditShortcuts.handle(event)
+    }
 }
 
 /// Одна чёлка на одном экране: окно, наведение мыши, открытие и закрытие.
